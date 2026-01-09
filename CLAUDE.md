@@ -4,11 +4,11 @@ This file provides guidance to Claude Code when working with this repository.
 
 ## Project Overview
 
-x402 Stacks API Host - A Cloudflare Worker that exposes third-party APIs on a pay-per-use basis using the x402 protocol. Uses one Durable Object per API service for isolated state and usage tracking.
+x402 Stacks API Host - A Cloudflare Worker that exposes third-party APIs on a pay-per-use basis using the x402 protocol. Uses one Durable Object per agent (keyed by Stacks address) for isolated state and usage tracking.
 
-**Status**: Initial scaffolding complete. See REQUIREMENTS.md for goals and open questions.
+**Status**: Core infrastructure complete. Implementing OpenRouter proxy.
 
-**First target**: OpenRouter API for LLM access (100+ models via single endpoint).
+**MVP Target**: OpenRouter chat completions + /v1/models endpoint with x402 payments.
 
 ## Commands
 
@@ -38,6 +38,7 @@ npm run deploy:dry-run
 - worker-logs service binding for centralized logging
 
 **Endpoints:**
+- `/` - Service info
 - `/health` - Health check
 - `/v1/chat/completions` - OpenRouter proxy (x402 paid)
 - `/v1/models` - List available models
@@ -46,24 +47,45 @@ npm run deploy:dry-run
 **Project Structure:**
 ```
 src/
-  index.ts          # Worker entry + OpenRouterDO class
-  # Planned:
-  services/
-    openrouter.ts   # OpenRouter proxy logic
-  middleware/
-    x402.ts         # x402 payment verification
-  types.ts          # TypeScript interfaces
+├── index.ts           # Hono app + OpenRouterDO class
+├── types.ts           # TypeScript interfaces
+└── utils/
+    └── logger.ts      # worker-logs integration
+# Planned:
+├── services/
+│   └── openrouter.ts  # OpenRouter proxy logic
+└── middleware/
+    └── x402.ts        # x402 payment verification
 ```
+
+## Key Decisions (from REQUIREMENTS.md)
+
+| Area | Decision |
+|------|----------|
+| **Pricing** | Pass-through OpenRouter cost + 20% margin |
+| **Payment timing** | Pre-pay estimate, credit for retry on failure |
+| **Payment tokens** | STX, sBTC, USDC (all supported) |
+| **Agent ID** | Stacks address from x402 payment |
+| **DO routing** | `idFromName(stacksAddress)` |
+| **Streaming** | Pass-through SSE with tight logging |
+| **Models** | All OpenRouter models (dynamic pricing) |
+| **Rate limits** | Requests per minute (RPM) |
+| **Extensibility** | Base class + service extensions |
 
 ## Durable Objects
 
-**OpenRouterDO** - Per-agent state for OpenRouter API:
+**OpenRouterDO** - Per-agent state (one DO per Stacks address):
+- Identity storage (agent_id, created_at)
 - Usage tracking (tokens, cost per request)
 - Daily stats aggregation
 - Rate limiting (TODO)
-- SQLite-backed storage
+- Retry credits (TODO)
 
-DO instance routing: Each agent gets their own DO instance, keyed by agent identifier (TBD: Stacks address, API key, or x402 payment ID).
+**Best Practices Applied:**
+- `blockConcurrencyWhile()` in constructor for schema init
+- RPC methods instead of fetch() handler
+- SQLite storage (recommended over KV)
+- Error handling with try/catch around all operations
 
 ## Configuration
 
@@ -75,17 +97,45 @@ DO instance routing: Each agent gets their own DO instance, keyed by agent ident
 
 **LOGS** - Universal logging service (RPC binding to worker-logs)
 ```typescript
-await env.LOGS.info('x402-api-host', 'Request proxied', { model, tokens })
-await env.LOGS.error('x402-api-host', 'OpenRouter error', { error })
+// Via logger utility
+const log = getLogger(c);
+log.info("Request proxied", { model, tokens });
+log.error("OpenRouter error", { error });
 ```
 
-## Key Decisions Needed
+## Important: Consult Documentation
 
-See REQUIREMENTS.md for full list. Key blockers:
-1. Pricing model: Pass-through + margin vs flat rate?
-2. Payment timing: Pre-pay estimate vs post-pay actual?
-3. Agent identification: How to route to agent's DO?
-4. Streaming: How to handle SSE with x402?
+**ALWAYS check official docs before implementing features:**
+
+### Cloudflare Workers & Durable Objects
+- [Rules of Durable Objects](https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/) - **MUST READ** for DO patterns
+- [SQLite in DOs](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/)
+- [Service Bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/)
+- [Hono on Workers](https://hono.dev/docs/getting-started/cloudflare-workers)
+
+### OpenRouter API
+- [API Reference](https://openrouter.ai/docs/api/reference/overview)
+- [Chat Completions](https://openrouter.ai/docs/quickstart)
+- [Authentication](https://openrouter.ai/docs/api/reference/authentication)
+- [Streaming](https://openrouter.ai/docs/api/reference/overview#streaming)
+- [Generation Stats](https://openrouter.ai/docs/api-reference/generation-stats)
+
+### x402 Protocol
+- [x402 Protocol](https://www.x402.org/)
+- [x402 Documentation](https://docs.cdp.coinbase.com/x402/welcome)
+- [x402 GitHub](https://github.com/coinbase/x402)
+
+## Best Practices Checklist
+
+When implementing new features, verify:
+
+- [ ] **Consulted official docs** for the API/service being used
+- [ ] **Error handling** - try/catch around external calls, log errors
+- [ ] **Type safety** - proper TypeScript types, no `any`
+- [ ] **DO patterns** - RPC methods, blockConcurrencyWhile for init, no global singleton
+- [ ] **Logging** - use `getLogger(c)` for request-correlated logs
+- [ ] **Non-blocking** - use `ctx.waitUntil()` for background work
+- [ ] **Security** - validate inputs, sanitize outputs, no secrets in logs
 
 ## Related Projects
 
@@ -93,8 +143,8 @@ See REQUIREMENTS.md for full list. Key blockers:
 - `../x402Stacks-sponsor-relay/` - Sponsor relay for gasless transactions
 
 **Best Practice References:**
-- `~/dev/absorbingchaos/thundermountainbuilders/` - CF Worker patterns
 - `~/dev/whoabuddy/worker-logs/` - Universal logging with DOs
+- `~/dev/whoabuddy/stx402/` - Example x402 implementation with DOs
 
 **aibtcdev Resources:**
 - `../erc-8004-stacks/` - Agent identity contracts
@@ -117,7 +167,8 @@ Set via `wrangler secret put`:
 
 - Follow existing aibtcdev patterns for Cloudflare Workers
 - Use `wrangler.jsonc` format with comments (not .toml)
-- One DO class per API service (OpenRouterDO, future: ImageGenDO, etc.)
+- Base DO class pattern for extensibility (future: ImageGenDO, etc.)
 - Use SQLite in DOs for usage tracking (`new_sqlite_classes` in migrations)
 - Integrate worker-logs early for debugging
 - OpenRouter uses OpenAI-compatible API format
+- Always run `npm run check` before committing

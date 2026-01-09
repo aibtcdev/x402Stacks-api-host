@@ -87,46 +87,90 @@ OpenRouter charges per token based on the model. We need to:
 2. Add our margin for x402 infrastructure
 3. Handle different pricing per model
 
-## Open Questions
+## Decisions
+
+Decisions made on 2025-01-09:
+
+### Payment & Pricing
+
+| Question | Decision |
+|----------|----------|
+| **Pricing model** | Pass-through OpenRouter costs + **20% margin** |
+| **Payment timing** | **Pre-pay** based on estimate. Credit stored in DO for free retry on upstream failure (with loop protection) |
+| **Payment tokens** | **All three**: STX, sBTC, and USDC on Stacks |
+
+### Agent Identity
+
+| Question | Decision |
+|----------|----------|
+| **Agent identification** | **Stacks address** from x402 payment |
+| **DO routing** | Use payer's Stacks address as DO key via `idFromName(stacksAddress)` |
+
+### API Design
+
+| Question | Decision |
+|----------|----------|
+| **Streaming** | **Pass-through** SSE stream with tight logging for PnL tracking |
+| **Model selection** | **All OpenRouter models** allowed, dynamic pricing based on model |
+| **Error handling** | **Credit for retry** stored in DO. Guard against retry loops (max retries, cooldown) |
+
+### Operations
+
+| Question | Decision |
+|----------|----------|
+| **Rate limits** | **Requests per minute** (RPM). Start simple, can add token limits later |
+| **Cost tracking** | **DO-only tracking**. Query agent DOs for reports and reconciliation |
+
+### Architecture
+
+| Question | Decision |
+|----------|----------|
+| **Service extensibility** | **Base class + extensions**. Abstract BaseDO with service-specific subclasses |
+| **MVP scope** | **OpenRouter chat completions + /v1/models**. Get x402 flow working end-to-end |
+
+## Open Questions (Resolved)
+
+<details>
+<summary>Original questions (click to expand)</summary>
 
 ### Payment & Pricing
 
 1. **Pricing model**: How to price requests?
-   - Pass-through OpenRouter costs + fixed margin?
+   - Pass-through OpenRouter costs + fixed margin? ✅ **Selected**
    - Flat rate per request regardless of model?
    - Token-based pricing matching upstream?
 
 2. **Payment timing**: When does payment happen?
-   - Pre-pay before request (estimate tokens)?
+   - Pre-pay before request (estimate tokens)? ✅ **Selected** (with retry credit)
    - Post-pay after response (actual tokens)?
    - Hybrid with deposits?
 
 3. **Payment token**: What token for payments?
-   - STX native?
-   - aBTC?
-   - USDC on Stacks?
+   - STX native? ✅ **Selected**
+   - aBTC? ✅ **Selected** (as sBTC)
+   - USDC on Stacks? ✅ **Selected**
 
 ### Agent Identity
 
 4. **Agent identification**: How to identify agents?
-   - x402 payment includes agent identity?
+   - x402 payment includes agent identity? ✅ **Selected** (Stacks address)
    - Separate API key per agent?
    - ERC-8004 identity registry lookup?
 
 5. **DO routing**: How to route to agent's DO?
-   - Hash of agent's Stacks address?
+   - Hash of agent's Stacks address? ✅ **Selected**
    - Agent ID from x402 payment?
    - API key maps to DO ID?
 
 ### API Design
 
 6. **Streaming**: How to handle SSE streaming?
-   - Pass through stream with x402 header?
+   - Pass through stream with x402 header? ✅ **Selected**
    - Buffer and charge after completion?
    - Different pricing for streaming?
 
 7. **Model selection**: How to handle model routing?
-   - Allow any OpenRouter model?
+   - Allow any OpenRouter model? ✅ **Selected**
    - Whitelist specific models?
    - Different pricing tiers?
 
@@ -134,31 +178,34 @@ OpenRouter charges per token based on the model. We need to:
    - Refund x402 payment?
    - Retry with different provider?
    - Partial refund for partial responses?
+   - ✅ **Selected**: Credit for retry (stored in DO)
 
 ### Operations
 
 9. **Rate limits**: What limits are appropriate?
-   - Requests per minute/hour?
+   - Requests per minute/hour? ✅ **Selected** (RPM)
    - Tokens per day?
    - Concurrent requests?
 
 10. **Cost tracking**: How to track our costs?
     - OpenRouter provides usage stats
-    - Store in DO for reconciliation
+    - Store in DO for reconciliation ✅ **Selected**
     - Dashboard for monitoring?
 
 ### Future Services
 
 11. **Service extensibility**: How to add more APIs?
     - One DO class per service?
-    - Shared base class with service-specific logic?
+    - Shared base class with service-specific logic? ✅ **Selected**
     - Plugin architecture?
 
-12. **Other APIs to add**:
+12. **Other APIs to add** (future):
     - Image generation (DALL-E, Midjourney)?
     - Voice/TTS (ElevenLabs)?
     - Search APIs?
     - Database services?
+
+</details>
 
 ## Context
 

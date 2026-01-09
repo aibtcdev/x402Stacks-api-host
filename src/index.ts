@@ -20,6 +20,8 @@ import {
   OpenRouterError,
   type ChatCompletionRequest,
 } from "./services/openrouter";
+import { x402PaymentMiddleware, getX402Context, type X402Context } from "./middleware/x402";
+import { logPnL } from "./utils/pricing";
 import type {
   Env,
   AppVariables,
@@ -35,6 +37,12 @@ import type {
 
 /** Margin added to OpenRouter costs (20% as decided) */
 const COST_MARGIN = 0.20;
+
+// =============================================================================
+// Extended App Variables (includes x402 context)
+// =============================================================================
+
+type AppVarsWithX402 = AppVariables & { x402?: X402Context };
 
 // =============================================================================
 // OpenRouter Durable Object
@@ -307,7 +315,7 @@ export class OpenRouterDO extends DurableObject<Env> {
 // Hono App
 // =============================================================================
 
-const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
+const app = new Hono<{ Bindings: Env; Variables: AppVarsWithX402 }>();
 
 // CORS middleware
 app.use(
@@ -315,7 +323,8 @@ app.use(
   cors({
     origin: "*",
     allowMethods: ["GET", "POST", "OPTIONS"],
-    allowHeaders: ["X-PAYMENT", "X-PAYMENT-TOKEN-TYPE", "Authorization", "X-Agent-ID"],
+    allowHeaders: ["X-PAYMENT", "X-PAYMENT-TOKEN-TYPE", "Authorization", "X-Agent-ID", "Content-Type"],
+    exposeHeaders: ["X-PAYMENT-RESPONSE", "X-PAYER-ADDRESS", "X-Request-ID"],
   })
 );
 
@@ -428,11 +437,11 @@ app.get("/v1/models", async (c) => {
   }
 });
 
-app.post("/v1/chat/completions", async (c) => {
+app.post("/v1/chat/completions", x402PaymentMiddleware(), async (c) => {
   const log = getLogger(c);
   const requestId = c.get("requestId");
 
-  log.info("Chat completion request received");
+  log.info("Chat completion request received (x402 verified)");
 
   try {
     // Check for API key
@@ -444,19 +453,22 @@ app.post("/v1/chat/completions", async (c) => {
       );
     }
 
-    // Parse request body
-    let body: ChatCompletionRequest;
-    try {
-      body = await c.req.json<ChatCompletionRequest>();
-    } catch {
-      log.warn("Invalid JSON in request body");
+    // Get x402 context (set by middleware after payment verification)
+    const x402 = getX402Context(c);
+    if (!x402) {
+      // This shouldn't happen - middleware should have returned 402
+      log.error("x402 context not found after middleware");
       return c.json(
-        { error: "Invalid JSON in request body", request_id: requestId },
-        { status: 400 }
+        { error: "Payment verification failed", request_id: requestId },
+        { status: 500 }
       );
     }
 
-    // Validate required fields
+    // Get body from x402 context (middleware already parsed and validated)
+    const body = x402.parsedBody;
+    const agentId = x402.payerAddress;
+
+    // Validate required fields (middleware validates for pricing, but double-check)
     if (!body.model) {
       return c.json(
         { error: "Missing required field: model", request_id: requestId },
@@ -470,15 +482,13 @@ app.post("/v1/chat/completions", async (c) => {
       );
     }
 
-    // Get agent ID (for usage tracking)
-    // TODO: Replace with x402 payment verification
-    const agentId = getAgentId(c);
-
     log.info("Processing chat completion", {
       model: body.model,
       messageCount: body.messages.length,
       stream: body.stream,
-      agentId: agentId || "anonymous",
+      agentId,
+      tokenType: x402.priceEstimate.tokenType,
+      estimatedCostUsd: x402.priceEstimate.costWithMarginUsd.toFixed(6),
     });
 
     // Create OpenRouter client
@@ -489,11 +499,11 @@ app.post("/v1/chat/completions", async (c) => {
       // Streaming response
       const { stream, model } = await client.createChatCompletionStream(body);
 
-      log.info("Streaming response started", { model });
+      log.info("Streaming response started", { model, agentId });
 
-      // TODO: Track streaming usage after completion
-      // For now, we can't accurately track tokens for streaming
-      // Will need to parse SSE events or use generation stats endpoint
+      // Note: For streaming, we can't accurately track actual tokens
+      // PnL logging will use estimated values
+      // Future: Parse SSE events or use generation stats endpoint
 
       return new Response(stream, {
         headers: {
@@ -501,6 +511,7 @@ app.post("/v1/chat/completions", async (c) => {
           "Cache-Control": "no-cache",
           "Connection": "keep-alive",
           "X-Request-ID": requestId,
+          "X-PAYER-ADDRESS": agentId,
         },
       });
     } else {
@@ -514,37 +525,44 @@ app.post("/v1/chat/completions", async (c) => {
         model: usage.model,
         promptTokens: usage.promptTokens,
         completionTokens: usage.completionTokens,
-        estimatedCostUsd: usage.estimatedCostUsd,
+        actualCostUsd: usage.estimatedCostUsd,
         totalCostWithMargin: totalCost,
-        agentId: agentId || "anonymous",
+        agentId,
       });
 
-      // Record usage in DO if agent is identified
-      if (agentId) {
-        try {
-          const stub = getAgentDO(c.env, agentId);
+      // Log PnL (estimated vs actual costs)
+      logPnL(
+        x402.priceEstimate,
+        usage.estimatedCostUsd,
+        usage.promptTokens,
+        usage.completionTokens,
+        log
+      );
 
-          // Initialize agent if first request
-          await stub.init(agentId);
+      // Record usage in agent's DO
+      try {
+        const stub = getAgentDO(c.env, agentId);
 
-          // Record usage
-          const usageRecord: UsageRecord = {
-            requestId,
-            model: usage.model,
-            promptTokens: usage.promptTokens,
-            completionTokens: usage.completionTokens,
-            costUsd: totalCost,
-          };
-          await stub.recordUsage(usageRecord);
+        // Initialize agent if first request
+        await stub.init(agentId);
 
-          log.debug("Usage recorded in DO", { agentId, requestId });
-        } catch (doError) {
-          // Log but don't fail the request if DO recording fails
-          log.error("Failed to record usage in DO", {
-            error: doError instanceof Error ? doError.message : String(doError),
-            agentId,
-          });
-        }
+        // Record usage
+        const usageRecord: UsageRecord = {
+          requestId,
+          model: usage.model,
+          promptTokens: usage.promptTokens,
+          completionTokens: usage.completionTokens,
+          costUsd: totalCost,
+        };
+        await stub.recordUsage(usageRecord);
+
+        log.debug("Usage recorded in DO", { agentId, requestId });
+      } catch (doError) {
+        // Log but don't fail the request if DO recording fails
+        log.error("Failed to record usage in DO", {
+          error: doError instanceof Error ? doError.message : String(doError),
+          agentId,
+        });
       }
 
       return c.json(response);

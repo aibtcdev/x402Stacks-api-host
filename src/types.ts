@@ -34,6 +34,10 @@ export interface Env {
   OPENROUTER_API_KEY: string;
   // Environment variables
   ENVIRONMENT: string;
+  // x402 payment config
+  X402_FACILITATOR_URL: string;
+  X402_NETWORK: "mainnet" | "testnet";
+  X402_SERVER_ADDRESS: string;
 }
 
 // =============================================================================

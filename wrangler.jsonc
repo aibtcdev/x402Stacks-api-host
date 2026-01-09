@@ -43,7 +43,12 @@
    * - OPENROUTER_API_KEY: API key for OpenRouter
    */
   "vars": {
-    "ENVIRONMENT": "development"
+    "ENVIRONMENT": "development",
+    // x402 payment config - mainnet by default
+    "X402_FACILITATOR_URL": "https://facilitator.x402stacks.xyz",
+    "X402_NETWORK": "mainnet",
+    // Server address to receive payments (set per environment)
+    "X402_SERVER_ADDRESS": ""
   },
 
   /**
@@ -53,14 +58,20 @@
     "staging": {
       "routes": [{ "pattern": "api-staging.aibtc.dev", "custom_domain": true }],
       "vars": {
-        "ENVIRONMENT": "staging"
+        "ENVIRONMENT": "staging",
+        "X402_FACILITATOR_URL": "https://facilitator.x402stacks.xyz",
+        "X402_NETWORK": "testnet",
+        "X402_SERVER_ADDRESS": ""
       }
     },
 
     "production": {
       "routes": [{ "pattern": "api.aibtc.dev", "custom_domain": true }],
       "vars": {
-        "ENVIRONMENT": "production"
+        "ENVIRONMENT": "production",
+        "X402_FACILITATOR_URL": "https://facilitator.x402stacks.xyz",
+        "X402_NETWORK": "mainnet",
+        "X402_SERVER_ADDRESS": ""
       }
     }
   }

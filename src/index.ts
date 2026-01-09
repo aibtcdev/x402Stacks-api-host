@@ -15,6 +15,11 @@ import { DurableObject } from "cloudflare:workers";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { loggerMiddleware, getLogger } from "./utils/logger";
+import {
+  OpenRouterClient,
+  OpenRouterError,
+  type ChatCompletionRequest,
+} from "./services/openrouter";
 import type {
   Env,
   AppVariables,
@@ -22,8 +27,14 @@ import type {
   DailyStats,
   AgentIdentity,
   HealthResponse,
-  StatsResponse,
 } from "./types";
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/** Margin added to OpenRouter costs (20% as decided) */
+const COST_MARGIN = 0.20;
 
 // =============================================================================
 // OpenRouter Durable Object
@@ -304,7 +315,7 @@ app.use(
   cors({
     origin: "*",
     allowMethods: ["GET", "POST", "OPTIONS"],
-    allowHeaders: ["X-PAYMENT", "X-PAYMENT-TOKEN-TYPE", "Authorization"],
+    allowHeaders: ["X-PAYMENT", "X-PAYMENT-TOKEN-TYPE", "Authorization", "X-Agent-ID"],
   })
 );
 
@@ -343,57 +354,230 @@ app.get("/health", (c) => {
 });
 
 // =============================================================================
+// Helper Functions
+// =============================================================================
+
+/**
+ * Get DO stub for an agent
+ * Uses Stacks address as the DO key
+ * Returns typed stub for RPC method calls
+ */
+function getAgentDO(env: Env, agentId: string): DurableObjectStub<OpenRouterDO> {
+  const id = env.OPENROUTER_DO.idFromName(agentId);
+  return env.OPENROUTER_DO.get(id) as DurableObjectStub<OpenRouterDO>;
+}
+
+/**
+ * Extract agent ID from request
+ * TODO: Get from x402 payment header once implemented
+ * For now, uses X-Agent-ID header for testing
+ */
+function getAgentId(c: { req: { header: (name: string) => string | undefined } }): string | null {
+  // Check for x402 payment header (future)
+  // const paymentHeader = c.req.header("X-PAYMENT");
+  // if (paymentHeader) { extract payer address }
+
+  // For testing: use X-Agent-ID header
+  const agentId = c.req.header("X-Agent-ID");
+  return agentId || null;
+}
+
+// =============================================================================
 // OpenRouter Proxy Endpoints
 // =============================================================================
+
+app.get("/v1/models", async (c) => {
+  const log = getLogger(c);
+
+  log.info("Models list requested");
+
+  try {
+    // Check for API key
+    if (!c.env.OPENROUTER_API_KEY) {
+      log.error("OPENROUTER_API_KEY not configured");
+      return c.json(
+        { error: "Service not configured" },
+        { status: 503 }
+      );
+    }
+
+    const client = new OpenRouterClient(c.env.OPENROUTER_API_KEY, log);
+    const models = await client.getModels();
+
+    log.info("Models fetched successfully", { count: models.data.length });
+
+    return c.json(models);
+  } catch (error) {
+    if (error instanceof OpenRouterError) {
+      log.error("OpenRouter error fetching models", {
+        status: error.status,
+        details: error.details,
+      });
+      const status = error.status >= 500 ? 502 : error.status;
+      return c.json({ error: error.message }, status as 400 | 401 | 402 | 403 | 404 | 429 | 502);
+    }
+
+    log.error("Failed to fetch models", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    return c.json(
+      { error: "Internal server error" },
+      { status: 500 }
+    );
+  }
+});
 
 app.post("/v1/chat/completions", async (c) => {
   const log = getLogger(c);
   const requestId = c.get("requestId");
 
-  log.info("Chat completion request received", {
-    method: c.req.method,
-  });
+  log.info("Chat completion request received");
 
   try {
-    // TODO: Implement x402 payment verification
-    // TODO: Proxy to OpenRouter with our API key
-    // TODO: Record usage in DO
+    // Check for API key
+    if (!c.env.OPENROUTER_API_KEY) {
+      log.error("OPENROUTER_API_KEY not configured");
+      return c.json(
+        { error: "Service not configured", request_id: requestId },
+        { status: 503 }
+      );
+    }
 
-    return c.json(
-      { error: "Not implemented", request_id: requestId },
-      { status: 501 }
-    );
+    // Parse request body
+    let body: ChatCompletionRequest;
+    try {
+      body = await c.req.json<ChatCompletionRequest>();
+    } catch {
+      log.warn("Invalid JSON in request body");
+      return c.json(
+        { error: "Invalid JSON in request body", request_id: requestId },
+        { status: 400 }
+      );
+    }
+
+    // Validate required fields
+    if (!body.model) {
+      return c.json(
+        { error: "Missing required field: model", request_id: requestId },
+        { status: 400 }
+      );
+    }
+    if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
+      return c.json(
+        { error: "Missing required field: messages", request_id: requestId },
+        { status: 400 }
+      );
+    }
+
+    // Get agent ID (for usage tracking)
+    // TODO: Replace with x402 payment verification
+    const agentId = getAgentId(c);
+
+    log.info("Processing chat completion", {
+      model: body.model,
+      messageCount: body.messages.length,
+      stream: body.stream,
+      agentId: agentId || "anonymous",
+    });
+
+    // Create OpenRouter client
+    const client = new OpenRouterClient(c.env.OPENROUTER_API_KEY, log);
+
+    // Handle streaming vs non-streaming
+    if (body.stream) {
+      // Streaming response
+      const { stream, model } = await client.createChatCompletionStream(body);
+
+      log.info("Streaming response started", { model });
+
+      // TODO: Track streaming usage after completion
+      // For now, we can't accurately track tokens for streaming
+      // Will need to parse SSE events or use generation stats endpoint
+
+      return new Response(stream, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+          "X-Request-ID": requestId,
+        },
+      });
+    } else {
+      // Non-streaming response
+      const { response, usage } = await client.createChatCompletion(body);
+
+      // Calculate cost with margin
+      const totalCost = usage.estimatedCostUsd * (1 + COST_MARGIN);
+
+      log.info("Chat completion successful", {
+        model: usage.model,
+        promptTokens: usage.promptTokens,
+        completionTokens: usage.completionTokens,
+        estimatedCostUsd: usage.estimatedCostUsd,
+        totalCostWithMargin: totalCost,
+        agentId: agentId || "anonymous",
+      });
+
+      // Record usage in DO if agent is identified
+      if (agentId) {
+        try {
+          const stub = getAgentDO(c.env, agentId);
+
+          // Initialize agent if first request
+          await stub.init(agentId);
+
+          // Record usage
+          const usageRecord: UsageRecord = {
+            requestId,
+            model: usage.model,
+            promptTokens: usage.promptTokens,
+            completionTokens: usage.completionTokens,
+            costUsd: totalCost,
+          };
+          await stub.recordUsage(usageRecord);
+
+          log.debug("Usage recorded in DO", { agentId, requestId });
+        } catch (doError) {
+          // Log but don't fail the request if DO recording fails
+          log.error("Failed to record usage in DO", {
+            error: doError instanceof Error ? doError.message : String(doError),
+            agentId,
+          });
+        }
+      }
+
+      return c.json(response);
+    }
   } catch (error) {
+    if (error instanceof OpenRouterError) {
+      log.error("OpenRouter error", {
+        status: error.status,
+        details: error.details,
+        retryable: error.retryable,
+      });
+
+      // Map OpenRouter errors to appropriate status codes
+      const statusCode = (error.status >= 500 ? 502 : error.status) as 400 | 401 | 402 | 403 | 404 | 429 | 502;
+      return c.json(
+        {
+          error: error.message,
+          request_id: requestId,
+          retryable: error.retryable,
+        },
+        statusCode
+      );
+    }
+
     log.error("Chat completion failed", {
       error: error instanceof Error ? error.message : String(error),
     });
 
     return c.json(
       {
-        ok: false,
         error: "Internal server error",
-        requestId,
+        request_id: requestId,
       },
-      { status: 500 }
-    );
-  }
-});
-
-app.get("/v1/models", async (c) => {
-  const log = getLogger(c);
-
-  log.debug("Models list requested");
-
-  try {
-    // TODO: Fetch and cache models from OpenRouter
-    return c.json({ error: "Not implemented" }, { status: 501 });
-  } catch (error) {
-    log.error("Failed to fetch models", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-
-    return c.json(
-      { ok: false, error: "Internal server error" },
       { status: 500 }
     );
   }
@@ -406,12 +590,46 @@ app.get("/v1/models", async (c) => {
 app.get("/usage", async (c) => {
   const log = getLogger(c);
 
-  log.debug("Usage stats requested");
+  log.info("Usage stats requested");
 
   try {
-    // TODO: Authenticate agent and get their DO
-    // For now, return not implemented
-    return c.json({ error: "Not implemented" }, { status: 501 });
+    // Get agent ID from header
+    const agentId = getAgentId(c);
+
+    if (!agentId) {
+      return c.json(
+        { error: "Missing X-Agent-ID header" },
+        { status: 401 }
+      );
+    }
+
+    log.debug("Fetching usage for agent", { agentId });
+
+    // Get agent's DO
+    const stub = getAgentDO(c.env, agentId);
+
+    // Fetch stats
+    const [identity, dailyStats, totalUsage, recentUsage] = await Promise.all([
+      stub.getIdentity(),
+      stub.getStats(30), // Last 30 days
+      stub.getTotalUsage(),
+      stub.getRecentUsage(20), // Last 20 requests
+    ]);
+
+    log.info("Usage stats fetched", {
+      agentId,
+      totalRequests: totalUsage.totalRequests,
+    });
+
+    return c.json({
+      ok: true,
+      data: {
+        agent: identity,
+        totals: totalUsage,
+        dailyStats,
+        recentRequests: recentUsage,
+      },
+    });
   } catch (error) {
     log.error("Failed to get usage stats", {
       error: error instanceof Error ? error.message : String(error),

@@ -22,6 +22,7 @@ import {
 } from "./services/openrouter";
 import { x402PaymentMiddleware, getX402Context, type X402Context } from "./middleware/x402";
 import { logPnL } from "./utils/pricing";
+import { isValidStacksAddress } from "x402-stacks";
 import type {
   Env,
   AppVariables,
@@ -323,7 +324,7 @@ app.use(
   cors({
     origin: "*",
     allowMethods: ["GET", "POST", "OPTIONS"],
-    allowHeaders: ["X-PAYMENT", "X-PAYMENT-TOKEN-TYPE", "Authorization", "X-Agent-ID", "Content-Type"],
+    allowHeaders: ["X-PAYMENT", "X-PAYMENT-TOKEN-TYPE", "Authorization", "X-Agent-ID", "X-Stacks-Address", "Content-Type"],
     exposeHeaders: ["X-PAYMENT-RESPONSE", "X-PAYER-ADDRESS", "X-Request-ID"],
   })
 );
@@ -496,14 +497,66 @@ app.post("/v1/chat/completions", x402PaymentMiddleware(), async (c) => {
 
     // Handle streaming vs non-streaming
     if (body.stream) {
-      // Streaming response
-      const { stream, model } = await client.createChatCompletionStream(body);
+      // Streaming response with usage tracking
+      const { stream, model, usagePromise } = await client.createChatCompletionStream(body);
 
       log.info("Streaming response started", { model, agentId });
 
-      // Note: For streaming, we can't accurately track actual tokens
-      // PnL logging will use estimated values
-      // Future: Parse SSE events or use generation stats endpoint
+      // Track usage after stream completes (non-blocking)
+      c.executionCtx.waitUntil(
+        usagePromise.then(async (usage) => {
+          if (!usage) {
+            log.warn("No usage data from stream", { model, agentId });
+            return;
+          }
+
+          // Calculate cost with margin
+          const totalCost = usage.estimatedCostUsd * (1 + COST_MARGIN);
+
+          log.info("Streaming completion finished", {
+            model: usage.model,
+            promptTokens: usage.promptTokens,
+            completionTokens: usage.completionTokens,
+            actualCostUsd: usage.estimatedCostUsd,
+            totalCostWithMargin: totalCost,
+            agentId,
+          });
+
+          // Log PnL (estimated vs actual costs)
+          logPnL(
+            x402.priceEstimate,
+            usage.estimatedCostUsd,
+            usage.promptTokens,
+            usage.completionTokens,
+            log
+          );
+
+          // Record usage in agent's DO
+          try {
+            const stub = getAgentDO(c.env, agentId);
+            await stub.init(agentId);
+            const usageRecord: UsageRecord = {
+              requestId,
+              model: usage.model,
+              promptTokens: usage.promptTokens,
+              completionTokens: usage.completionTokens,
+              costUsd: totalCost,
+            };
+            await stub.recordUsage(usageRecord);
+            log.debug("Streaming usage recorded in DO", { agentId, requestId });
+          } catch (doError) {
+            log.error("Failed to record streaming usage in DO", {
+              error: doError instanceof Error ? doError.message : String(doError),
+              agentId,
+            });
+          }
+        }).catch((err) => {
+          log.error("Error tracking streaming usage", {
+            error: err instanceof Error ? err.message : String(err),
+            agentId,
+          });
+        })
+      );
 
       return new Response(stream, {
         headers: {
@@ -611,13 +664,29 @@ app.get("/usage", async (c) => {
   log.info("Usage stats requested");
 
   try {
-    // Get agent ID from header
-    const agentId = getAgentId(c);
+    // Get Stacks address from header
+    // Note: For production, this should require a signed message to prove ownership
+    // For MVP, we validate address format only (usage stats aren't sensitive)
+    const agentId = c.req.header("X-Stacks-Address") || c.req.header("X-Agent-ID");
 
     if (!agentId) {
       return c.json(
-        { error: "Missing X-Agent-ID header" },
+        {
+          error: "Missing Stacks address",
+          hint: "Provide your Stacks address in the X-Stacks-Address header",
+        },
         { status: 401 }
+      );
+    }
+
+    // Validate Stacks address format
+    if (!isValidStacksAddress(agentId)) {
+      return c.json(
+        {
+          error: "Invalid Stacks address format",
+          hint: "Address should start with SP (mainnet) or ST (testnet)",
+        },
+        { status: 400 }
       );
     }
 

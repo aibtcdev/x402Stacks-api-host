@@ -35,6 +35,10 @@ export interface ChatCompletionRequest {
   top_p?: number;
   max_tokens?: number;
   stream?: boolean;
+  /** OpenRouter stream options for usage tracking */
+  stream_options?: {
+    include_usage?: boolean;
+  };
   stop?: string | string[];
   presence_penalty?: number;
   frequency_penalty?: number;
@@ -99,6 +103,35 @@ export interface UsageInfo {
   completionTokens: number;
   totalTokens: number;
   estimatedCostUsd: number;
+}
+
+/** Streaming chunk with optional usage (in final chunk) */
+export interface StreamingChunk {
+  id?: string;
+  object?: string;
+  created?: number;
+  model?: string;
+  choices?: Array<{
+    index: number;
+    delta: {
+      role?: string;
+      content?: string;
+    };
+    finish_reason?: string | null;
+  }>;
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+}
+
+/** Result from streaming completion */
+export interface StreamingResult {
+  stream: ReadableStream;
+  model: string;
+  /** Promise that resolves with usage info after stream completes */
+  usagePromise: Promise<UsageInfo | null>;
 }
 
 // =============================================================================
@@ -207,17 +240,23 @@ export class OpenRouterClient {
 
   /**
    * Create a streaming chat completion
-   * Returns a ReadableStream that can be piped to the client
+   * Returns a ReadableStream that can be piped to the client,
+   * plus a promise that resolves with usage info after stream completes
    */
   async createChatCompletionStream(
     request: ChatCompletionRequest
-  ): Promise<{ stream: ReadableStream; model: string }> {
+  ): Promise<StreamingResult> {
     this.log.info("Creating streaming chat completion", {
       model: request.model,
       messageCount: request.messages.length,
     });
 
-    const payload = { ...request, stream: true };
+    // Enable usage tracking in the stream
+    const payload = {
+      ...request,
+      stream: true,
+      stream_options: { include_usage: true },
+    };
 
     const response = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
       method: "POST",
@@ -245,10 +284,129 @@ export class OpenRouterClient {
 
     this.log.debug("Streaming response started", { model: request.model });
 
+    // Create usage capture variables
+    let capturedUsage: UsageInfo | null = null;
+    let usageResolve: (usage: UsageInfo | null) => void;
+    const usagePromise = new Promise<UsageInfo | null>((resolve) => {
+      usageResolve = resolve;
+    });
+
+    // Create a transform stream that captures usage from final chunk
+    const transformStream = this.createUsageCapturingStream(
+      response.body,
+      request.model,
+      (usage) => {
+        capturedUsage = usage;
+        this.log.info("Streaming usage captured", {
+          model: usage.model,
+          promptTokens: usage.promptTokens,
+          completionTokens: usage.completionTokens,
+          estimatedCostUsd: usage.estimatedCostUsd,
+        });
+        usageResolve(usage);
+      },
+      () => {
+        // Stream ended without usage (shouldn't happen with include_usage: true)
+        if (!capturedUsage) {
+          this.log.warn("Stream ended without usage data");
+          usageResolve(null);
+        }
+      }
+    );
+
     return {
-      stream: response.body,
+      stream: transformStream,
       model: request.model,
+      usagePromise,
     };
+  }
+
+  /**
+   * Create a transform stream that passes through SSE events
+   * while capturing usage from the final chunk
+   */
+  private createUsageCapturingStream(
+    sourceStream: ReadableStream,
+    requestModel: string,
+    onUsage: (usage: UsageInfo) => void,
+    onComplete: () => void
+  ): ReadableStream {
+    const log = this.log;
+    const estimateCost = this.estimateCost.bind(this);
+    let buffer = "";
+
+    return new ReadableStream({
+      async start(controller) {
+        const reader = sourceStream.getReader();
+        const decoder = new TextDecoder();
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+
+            if (done) {
+              // Flush any remaining buffer
+              if (buffer.trim()) {
+                controller.enqueue(new TextEncoder().encode(buffer));
+              }
+              controller.close();
+              onComplete();
+              break;
+            }
+
+            // Decode and pass through
+            const text = decoder.decode(value, { stream: true });
+            buffer += text;
+
+            // Parse SSE events to find usage
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || ""; // Keep incomplete line in buffer
+
+            for (const line of lines) {
+              if (line.startsWith("data: ")) {
+                const data = line.slice(6).trim();
+
+                if (data === "[DONE]") {
+                  continue;
+                }
+
+                try {
+                  const chunk = JSON.parse(data) as StreamingChunk;
+
+                  // Check for usage in final chunk
+                  if (chunk.usage) {
+                    const usage: UsageInfo = {
+                      model: chunk.model || requestModel,
+                      promptTokens: chunk.usage.prompt_tokens,
+                      completionTokens: chunk.usage.completion_tokens,
+                      totalTokens: chunk.usage.total_tokens,
+                      estimatedCostUsd: estimateCost(
+                        chunk.usage.prompt_tokens,
+                        chunk.usage.completion_tokens,
+                        chunk.model || requestModel
+                      ),
+                    };
+                    onUsage(usage);
+                  }
+                } catch {
+                  // Not valid JSON, might be partial - continue
+                  log.debug("Could not parse SSE chunk", { data });
+                }
+              }
+            }
+
+            // Pass through all data to client
+            controller.enqueue(value);
+          }
+        } catch (error) {
+          log.error("Error in stream transform", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          controller.error(error);
+          onComplete();
+        }
+      },
+    });
   }
 
   /**

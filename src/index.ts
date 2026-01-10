@@ -340,12 +340,19 @@ app.get("/", (c) => {
   return c.json({
     service: "x402-api-host",
     version: "0.1.0",
-    description: "x402 micropayment-gated API proxy for OpenRouter",
+    description: "x402 micropayment-gated API proxies",
+    services: {
+      openrouter: {
+        description: "OpenRouter LLM API (100+ models)",
+        endpoints: {
+          "GET /openrouter/v1/models": "List available models",
+          "POST /openrouter/v1/chat/completions": "Chat completions (x402 paid)",
+          "GET /openrouter/usage": "Usage stats (requires Stacks address)",
+        },
+      },
+    },
     endpoints: {
       "GET /health": "Health check",
-      "POST /v1/chat/completions": "OpenRouter proxy (x402 paid)",
-      "GET /v1/models": "List available models",
-      "GET /usage": "Get usage stats (requires auth)",
     },
   });
 });
@@ -396,7 +403,7 @@ function getAgentId(c: { req: { header: (name: string) => string | undefined } }
 // OpenRouter Proxy Endpoints
 // =============================================================================
 
-app.get("/v1/models", async (c) => {
+app.get("/openrouter/v1/models", async (c) => {
   const log = getLogger(c);
 
   log.info("Models list requested");
@@ -438,7 +445,7 @@ app.get("/v1/models", async (c) => {
   }
 });
 
-app.post("/v1/chat/completions", x402PaymentMiddleware(), async (c) => {
+app.post("/openrouter/v1/chat/completions", x402PaymentMiddleware(), async (c) => {
   const log = getLogger(c);
   const requestId = c.get("requestId");
 
@@ -658,7 +665,7 @@ app.post("/v1/chat/completions", x402PaymentMiddleware(), async (c) => {
 // Usage Stats Endpoint
 // =============================================================================
 
-app.get("/usage", async (c) => {
+app.get("/openrouter/usage", async (c) => {
   const log = getLogger(c);
 
   log.info("Usage stats requested");

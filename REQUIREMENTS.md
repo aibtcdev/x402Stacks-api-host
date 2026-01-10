@@ -2,15 +2,22 @@
 
 A Cloudflare Worker that exposes third-party APIs on a pay-per-use basis using the x402 protocol. Each API service gets its own Durable Object for isolated state, usage tracking, and rate limiting.
 
+## Domains
+
+| Environment | Domain | Network |
+|-------------|--------|---------|
+| **Production** | `x402-apis.aibtc.com` | mainnet |
+| **Staging** | `x402-apis.aibtc.dev` | testnet |
+
 ## Overview
 
 This service acts as an x402-enabled proxy for third-party APIs:
 
-1. Agent requests an API endpoint (e.g., `/v1/chat/completions`)
+1. Agent requests an API endpoint (e.g., `/openrouter/v1/chat/completions`)
 2. If unpaid, server responds with HTTP 402 and payment requirements
-3. Agent pays via x402 (Stacks-based payment)
+3. Agent signs payment and resends with `X-PAYMENT` header
 4. Request is proxied to the upstream API using our API key
-5. Usage is recorded in agent-specific Durable Object
+5. Usage is recorded in agent-specific Durable Object (keyed by Stacks address)
 6. Response is returned to agent
 
 **First target**: [OpenRouter API](https://openrouter.ai/docs) - unified access to 100+ LLM models.
@@ -19,17 +26,17 @@ This service acts as an x402-enabled proxy for third-party APIs:
 
 ### Primary Goals
 
-- [ ] **Pay-per-use API access**: Agents pay per request/token via x402
-- [ ] **One DO per service**: Isolated state for each API service (OpenRouter, etc.)
-- [ ] **Usage tracking**: Per-agent token counts, costs, request history
-- [ ] **OpenRouter integration**: Proxy `/v1/chat/completions` and related endpoints
+- [x] **Pay-per-use API access**: Agents pay per request/token via x402
+- [x] **One DO per agent**: Isolated state per Stacks address
+- [x] **Usage tracking**: Per-agent token counts, costs, request history
+- [x] **OpenRouter integration**: Proxy `/openrouter/v1/chat/completions` and `/openrouter/v1/models`
 
 ### Secondary Goals
 
 - [ ] **Rate limiting**: Per-agent rate limits to prevent abuse
 - [ ] **Spending caps**: Optional per-agent spending limits
-- [ ] **Multi-service**: Extensible pattern for adding more API services
-- [ ] **Streaming support**: Handle SSE streaming responses from LLMs
+- [x] **Multi-service**: Extensible pattern for adding more API services (subfolder per service)
+- [x] **Streaming support**: Handle SSE streaming with usage tracking from final chunk
 
 ## Architecture
 
@@ -59,10 +66,11 @@ Each agent gets their own DO instance (by agent ID), providing:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
+| `/` | GET | Service info and available APIs |
 | `/health` | GET | Health check |
-| `/v1/chat/completions` | POST | OpenRouter chat completions (x402 paid) |
-| `/v1/models` | GET | List available models |
-| `/usage` | GET | Agent's usage stats (authenticated) |
+| `/openrouter/v1/models` | GET | List available models |
+| `/openrouter/v1/chat/completions` | POST | Chat completions (x402 paid) |
+| `/openrouter/usage` | GET | Agent's usage stats (by Stacks address) |
 
 ## OpenRouter Integration
 
@@ -222,13 +230,20 @@ Decisions made on 2025-01-09:
 - `../erc-8004-stacks/` - Agent identity contracts
 - `../aibtcdev-cache/` - CF Worker with Durable Objects pattern
 
-## Next Steps
+## Implementation Status
 
-1. Implement basic OpenRouter proxy (no x402 yet)
-2. Add usage tracking in DO
-3. Integrate x402 payment verification
-4. Add streaming support
-5. Build usage dashboard
+### Completed
+1. ~~Implement basic OpenRouter proxy~~ ✅
+2. ~~Add usage tracking in DO~~ ✅
+3. ~~Integrate x402 payment verification~~ ✅
+4. ~~Add streaming support with usage tracking~~ ✅
+5. ~~Add service subfolder structure (`/openrouter`)~~ ✅
+
+### Remaining
+1. **Rate limiting** - RPM per agent
+2. **Credit/retry system** - Store credit for upstream failures
+3. **Signature auth for /usage** - Prove wallet ownership
+4. **Additional services** - Image generation, TTS, etc.
 
 ## Resources
 

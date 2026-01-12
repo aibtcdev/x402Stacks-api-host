@@ -1,0 +1,50 @@
+/**
+ * Sync Extend Endpoint
+ */
+import { StorageWriteEndpoint } from "../../base";
+import type { AppContext } from "../../../types";
+
+export class SyncExtend extends StorageWriteEndpoint {
+  schema = {
+    tags: ["Storage - Sync"],
+    summary: "(paid, storage_write) Extend a lock's TTL",
+    requestBody: {
+      required: true,
+      content: {
+        "application/json": {
+          schema: {
+            type: "object" as const,
+            required: ["name", "token"],
+            properties: {
+              name: { type: "string" as const },
+              token: { type: "string" as const },
+              ttl: { type: "integer" as const, description: "New TTL in seconds" },
+            },
+          },
+        },
+      },
+    },
+    parameters: [
+      { name: "tokenType", in: "query" as const, required: false, schema: { type: "string" as const, enum: ["STX", "sBTC", "USDCx"], default: "STX" } },
+    ],
+    responses: {
+      "200": { description: "Extend result" },
+      "402": { description: "Payment required" },
+    },
+  };
+
+  async handle(c: AppContext) {
+    const tokenType = this.getTokenType(c);
+    let body: { name?: string; token?: string; ttl?: number };
+    try { body = await c.req.json(); } catch { return this.errorResponse(c, "Invalid JSON body", 400); }
+
+    const { name, token, ttl } = body;
+    if (!name || !token) return this.errorResponse(c, "name and token are required", 400);
+
+    const storageDO = this.getStorageDO(c);
+    if (!storageDO) return this.errorResponse(c, "Storage not available", 500);
+
+    const result = await storageDO.syncExtend(name, token, { ttl });
+    return c.json({ ok: true, ...result, tokenType });
+  }
+}

@@ -2,21 +2,30 @@
  * x402 Payment Middleware
  *
  * Verifies x402 payments for API requests using the x402-stacks library.
- * Based on stx402 implementation pattern.
+ * Supports both fixed tier pricing and dynamic pricing for LLM endpoints.
  */
 
-import type { Context } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 import { X402PaymentVerifier } from "x402-stacks";
 import type { TokenContract } from "x402-stacks";
 import { deserializeTransaction } from "@stacks/transactions";
-import type { Env, AppVariables, Logger } from "../types";
-import type { ChatCompletionRequest } from "../services/openrouter";
+import type {
+  Env,
+  AppVariables,
+  Logger,
+  TokenType,
+  PricingTier,
+  PriceEstimate,
+  SettlePaymentResult,
+  X402Context,
+  ChatCompletionRequest,
+} from "../types";
 import {
-  estimatePaymentAmount,
   validateTokenType,
-  type TokenType,
-  type PriceEstimate,
-} from "../utils/pricing";
+  getFixedTierEstimate,
+  estimateChatPayment,
+  TIER_PRICING,
+} from "../services/pricing";
 
 // =============================================================================
 // Types
@@ -31,37 +40,25 @@ export interface X402PaymentRequired {
   expiresAt: string;
   tokenType: TokenType;
   tokenContract?: TokenContract;
-  estimate: {
-    model: string;
-    estimatedInputTokens: number;
-    estimatedOutputTokens: number;
-    estimatedCostUsd: string;
+  pricing: {
+    type: "fixed" | "dynamic";
+    tier?: PricingTier;
+    estimate?: {
+      model?: string;
+      estimatedInputTokens?: number;
+      estimatedOutputTokens?: number;
+      estimatedCostUsd?: string;
+    };
   };
 }
 
-export interface SettlePaymentResult {
-  isValid: boolean;
-  txId?: string;
-  status?: string;
-  blockHeight?: number;
-  error?: string;
-  reason?: string;
-  validationError?: string;
-  sender?: string;
-  senderAddress?: string;
-  sender_address?: string;
-  recipient?: string;
-  recipientAddress?: string;
-  recipient_address?: string;
-  [key: string]: unknown; // Index signature for logging compatibility
-}
-
-export interface X402Context {
-  payerAddress: string;
-  settleResult: SettlePaymentResult;
-  signedTx: string;
-  priceEstimate: PriceEstimate;
-  parsedBody: ChatCompletionRequest;
+export interface X402MiddlewareOptions {
+  /** Pricing tier for fixed pricing endpoints */
+  tier?: PricingTier;
+  /** Set to true for dynamic pricing (LLM endpoints) */
+  dynamic?: boolean;
+  /** Custom price estimator for dynamic pricing */
+  estimator?: (body: unknown, tokenType: TokenType, log: Logger) => PriceEstimate;
 }
 
 // =============================================================================
@@ -71,11 +68,11 @@ export interface X402Context {
 const TOKEN_CONTRACTS: Record<"mainnet" | "testnet", Record<"sBTC" | "USDCx", TokenContract>> = {
   mainnet: {
     sBTC: { address: "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4", name: "sbtc-token" },
-    USDCx: { address: "SP3Y2ZSH8P7D50B0VBTSX11S7XSG24M1VB9YFQA4K", name: "token-susdc" }, // xReserve USDCx
+    USDCx: { address: "SP3Y2ZSH8P7D50B0VBTSX11S7XSG24M1VB9YFQA4K", name: "token-susdc" },
   },
   testnet: {
     sBTC: { address: "ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT", name: "sbtc-token" },
-    USDCx: { address: "ST1NXBK3K5YYMD6FD41MVNP3JS1GABZ8TRVX023PT", name: "token-susdc" }, // xReserve USDCx
+    USDCx: { address: "ST1NXBK3K5YYMD6FD41MVNP3JS1GABZ8TRVX023PT", name: "token-susdc" },
   },
 };
 
@@ -103,7 +100,6 @@ function extractSenderFromTx(signedTxHex: string): string | null {
 
 /**
  * Extract payer address from settle result or signed tx
- * Uses both sources with fallback as decided
  */
 function extractPayerAddress(
   settleResult: SettlePaymentResult,
@@ -123,11 +119,8 @@ function extractPayerAddress(
   }
 
   // Fallback: extract hash160 from signed transaction
-  // Note: We use hash160 as identifier if full address not available from facilitator
   const hash160 = extractSenderFromTx(signedTxHex);
   if (hash160) {
-    // Use hash160 with network prefix as identifier
-    // This is a fallback - facilitator should normally return full address
     const identifier = `${network}:${hash160}`;
     log.debug("Payer identifier from tx deserialization (hash160)", { identifier, hash160 });
     return identifier;
@@ -152,58 +145,59 @@ function classifyPaymentError(error: unknown, settleResult?: SettlePaymentResult
   const validationError = settleResult?.validationError?.toLowerCase() || "";
   const combined = `${errorStr} ${resultError} ${resultReason} ${validationError}`;
 
-  // Network errors
   if (combined.includes("fetch") || combined.includes("network") || combined.includes("timeout")) {
     return { code: "NETWORK_ERROR", message: "Network error with payment facilitator", httpStatus: 502, retryAfter: 5 };
   }
 
-  // Facilitator unavailable
   if (combined.includes("503") || combined.includes("unavailable")) {
     return { code: "FACILITATOR_UNAVAILABLE", message: "Payment facilitator temporarily unavailable", httpStatus: 503, retryAfter: 30 };
   }
 
-  // Insufficient funds
   if (combined.includes("insufficient") || combined.includes("balance")) {
     return { code: "INSUFFICIENT_FUNDS", message: "Insufficient funds in wallet", httpStatus: 402 };
   }
 
-  // Payment expired
   if (combined.includes("expired") || combined.includes("nonce")) {
     return { code: "PAYMENT_EXPIRED", message: "Payment expired, please sign a new payment", httpStatus: 402 };
   }
 
-  // Amount too low
   if (combined.includes("amount") && (combined.includes("low") || combined.includes("minimum"))) {
     return { code: "AMOUNT_TOO_LOW", message: "Payment amount below minimum required", httpStatus: 402 };
   }
 
-  // Invalid payment
   if (combined.includes("invalid") || combined.includes("signature")) {
     return { code: "PAYMENT_INVALID", message: "Invalid payment signature", httpStatus: 400 };
   }
 
-  // Default
   return { code: "UNKNOWN_ERROR", message: "Payment processing error", httpStatus: 500, retryAfter: 5 };
 }
 
 // =============================================================================
-// Middleware
+// Middleware Factory
 // =============================================================================
 
 /**
- * Create x402 payment middleware for chat completions
+ * Create x402 payment middleware
  *
- * This middleware:
- * 1. Checks for X-PAYMENT header
- * 2. If missing, returns 402 with payment requirements
- * 3. If present, verifies payment with facilitator
- * 4. Extracts payer address and stores in context
+ * @param options - Configuration for the middleware
+ * @returns Hono middleware handler
+ *
+ * @example Fixed tier pricing:
+ * ```ts
+ * app.post("/hash/sha256", x402Middleware({ tier: "simple" }), handleHash);
+ * ```
+ *
+ * @example Dynamic pricing for LLM:
+ * ```ts
+ * app.post("/inference/chat", x402Middleware({ dynamic: true }), handleChat);
+ * ```
  */
-export function x402PaymentMiddleware() {
-  return async (
-    c: Context<{ Bindings: Env; Variables: AppVariables & { x402?: X402Context } }>,
-    next: () => Promise<Response | void>
-  ) => {
+export function x402Middleware(
+  options: X402MiddlewareOptions = {}
+): MiddlewareHandler<{ Bindings: Env; Variables: AppVariables }> {
+  const { tier = "simple", dynamic = false, estimator } = options;
+
+  return async (c, next) => {
     const log = c.var.logger;
 
     // Check if x402 is configured
@@ -221,16 +215,40 @@ export function x402PaymentMiddleware() {
       return c.json({ error: String(err) }, 400);
     }
 
-    // Parse request body to estimate cost
-    let body: ChatCompletionRequest;
-    try {
-      body = await c.req.json<ChatCompletionRequest>();
-    } catch {
-      return c.json({ error: "Invalid JSON in request body" }, 400);
+    // Calculate price estimate based on pricing type
+    let priceEstimate: PriceEstimate;
+    let parsedBody: unknown = undefined;
+
+    if (dynamic) {
+      // Dynamic pricing - need to parse body for estimation
+      try {
+        parsedBody = await c.req.json();
+      } catch {
+        return c.json({ error: "Invalid JSON in request body" }, 400);
+      }
+
+      if (estimator) {
+        priceEstimate = estimator(parsedBody, tokenType, log);
+      } else {
+        // Default: assume chat completion request
+        priceEstimate = estimateChatPayment(parsedBody as ChatCompletionRequest, tokenType, log);
+      }
+    } else {
+      // Fixed tier pricing
+      priceEstimate = getFixedTierEstimate(tier, tokenType);
     }
 
-    // Calculate price estimate
-    const priceEstimate = estimatePaymentAmount(body, tokenType, log);
+    // Skip payment for free tier
+    if (tier === "free" && !dynamic) {
+      c.set("x402", {
+        payerAddress: "anonymous",
+        settleResult: { isValid: true },
+        signedTx: "",
+        priceEstimate,
+        parsedBody,
+      } as X402Context);
+      return next();
+    }
 
     const config = {
       minAmount: priceEstimate.amountInToken,
@@ -245,7 +263,7 @@ export function x402PaymentMiddleware() {
     if (!signedTx) {
       // Return 402 with payment requirements
       log.info("No payment header, returning 402", {
-        model: body.model,
+        tier: dynamic ? "dynamic" : tier,
         amountRequired: config.minAmount.toString(),
         tokenType,
       });
@@ -265,12 +283,20 @@ export function x402PaymentMiddleware() {
         expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
         tokenType,
         ...(tokenContract && { tokenContract }),
-        estimate: {
-          model: priceEstimate.model,
-          estimatedInputTokens: priceEstimate.estimatedInputTokens,
-          estimatedOutputTokens: priceEstimate.estimatedOutputTokens,
-          estimatedCostUsd: priceEstimate.costWithMarginUsd.toFixed(6),
-        },
+        pricing: dynamic
+          ? {
+              type: "dynamic",
+              estimate: {
+                model: priceEstimate.model,
+                estimatedInputTokens: priceEstimate.estimatedInputTokens,
+                estimatedOutputTokens: priceEstimate.estimatedOutputTokens,
+                estimatedCostUsd: priceEstimate.costWithMarginUsd.toFixed(6),
+              },
+            }
+          : {
+              type: "fixed",
+              tier,
+            },
       };
 
       return c.json(paymentRequest, 402);
@@ -358,6 +384,7 @@ export function x402PaymentMiddleware() {
       payerAddress,
       tokenType,
       amount: config.minAmount.toString(),
+      tier: dynamic ? "dynamic" : tier,
     });
 
     // Store payment context for downstream use
@@ -366,7 +393,7 @@ export function x402PaymentMiddleware() {
       settleResult,
       signedTx,
       priceEstimate,
-      parsedBody: body,
+      parsedBody,
     } as X402Context);
 
     // Add response headers
@@ -381,7 +408,32 @@ export function x402PaymentMiddleware() {
  * Get x402 context from Hono context
  */
 export function getX402Context(
-  c: Context<{ Bindings: Env; Variables: AppVariables & { x402?: X402Context } }>
+  c: Context<{ Bindings: Env; Variables: AppVariables }>
 ): X402Context | null {
   return c.var.x402 || null;
 }
+
+// =============================================================================
+// Convenience Middleware Creators
+// =============================================================================
+
+/** Simple compute endpoints (0.001 STX) */
+export const x402Simple = () => x402Middleware({ tier: "simple" });
+
+/** AI-enhanced endpoints (0.003 STX) */
+export const x402AI = () => x402Middleware({ tier: "ai" });
+
+/** Heavy AI endpoints (0.01 STX) */
+export const x402HeavyAI = () => x402Middleware({ tier: "heavy_ai" });
+
+/** Storage read endpoints (0.001 STX) */
+export const x402StorageRead = () => x402Middleware({ tier: "storage_read" });
+
+/** Storage write endpoints (0.002 STX) */
+export const x402StorageWrite = () => x402Middleware({ tier: "storage_write" });
+
+/** Large storage write endpoints (0.005 STX) */
+export const x402StorageWriteLarge = () => x402Middleware({ tier: "storage_write_large" });
+
+/** Dynamic pricing for LLM endpoints */
+export const x402Dynamic = () => x402Middleware({ dynamic: true });

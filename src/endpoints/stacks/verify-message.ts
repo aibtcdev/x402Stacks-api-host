@@ -1,0 +1,120 @@
+/**
+ * Verify Message Endpoint
+ *
+ * Verifies a signed message using Stacks signatures.
+ */
+
+import { SimpleEndpoint } from "../base";
+import { verifyMessageSignatureRsv } from "@stacks/encryption";
+import type { AppContext } from "../../types";
+
+export class VerifyMessage extends SimpleEndpoint {
+  schema = {
+    tags: ["Stacks"],
+    summary: "(paid, simple) Verify a signed message",
+    description: "Verifies that a message was signed by a specific Stacks address.",
+    requestBody: {
+      required: true,
+      content: {
+        "application/json": {
+          schema: {
+            type: "object" as const,
+            required: ["message", "signature", "publicKey"],
+            properties: {
+              message: {
+                type: "string" as const,
+                description: "The original message that was signed",
+              },
+              signature: {
+                type: "string" as const,
+                description: "The signature in hex format",
+              },
+              publicKey: {
+                type: "string" as const,
+                description: "The public key in hex format",
+              },
+            },
+          },
+        },
+      },
+    },
+    parameters: [
+      {
+        name: "tokenType",
+        in: "query" as const,
+        required: false,
+        schema: {
+          type: "string" as const,
+          enum: ["STX", "sBTC", "USDCx"],
+          default: "STX",
+        },
+      },
+    ],
+    responses: {
+      "200": {
+        description: "Verification result",
+        content: {
+          "application/json": {
+            schema: {
+              type: "object" as const,
+              properties: {
+                ok: { type: "boolean" as const },
+                valid: { type: "boolean" as const },
+                message: { type: "string" as const },
+                tokenType: { type: "string" as const },
+              },
+            },
+          },
+        },
+      },
+      "400": { description: "Invalid input" },
+      "402": { description: "Payment required" },
+    },
+  };
+
+  async handle(c: AppContext) {
+    const tokenType = this.getTokenType(c);
+
+    let body: { message?: string; signature?: string; publicKey?: string };
+    try {
+      body = await c.req.json();
+    } catch {
+      return this.errorResponse(c, "Invalid JSON body", 400);
+    }
+
+    const { message, signature, publicKey } = body;
+
+    if (!message || typeof message !== "string") {
+      return this.errorResponse(c, "message is required", 400);
+    }
+    if (!signature || typeof signature !== "string") {
+      return this.errorResponse(c, "signature is required", 400);
+    }
+    if (!publicKey || typeof publicKey !== "string") {
+      return this.errorResponse(c, "publicKey is required", 400);
+    }
+
+    try {
+      // Normalize signature (remove 0x prefix if present)
+      const cleanSig = signature.startsWith("0x") ? signature.slice(2) : signature;
+      const cleanPubKey = publicKey.startsWith("0x") ? publicKey.slice(2) : publicKey;
+
+      // Verify the signature
+      const valid = verifyMessageSignatureRsv({
+        message,
+        signature: cleanSig,
+        publicKey: cleanPubKey,
+      });
+
+      return c.json({
+        ok: true,
+        valid,
+        message: valid ? "Signature is valid" : "Signature is invalid",
+        tokenType,
+      });
+    } catch (error) {
+      c.var.logger.warn("Signature verification error", { error: String(error) });
+      return this.errorResponse(c, `Verification failed: ${error instanceof Error ? error.message : String(error)}`, 400);
+    }
+  }
+}

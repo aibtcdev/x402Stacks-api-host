@@ -1,779 +1,278 @@
 /**
  * x402 Stacks API Host
  *
- * Cloudflare Worker exposing third-party APIs on a pay-per-use basis
- * using the x402 protocol.
- *
- * Architecture follows Cloudflare best practices (Dec 2025):
- * - SQLite-backed Durable Objects with RPC methods
- * - blockConcurrencyWhile() for schema initialization
- * - Hono for HTTP routing
- * - worker-logs integration for centralized logging
+ * Cloudflare Worker exposing APIs on a pay-per-use basis using the x402 protocol.
+ * Supports STX, sBTC, and USDCx payments via Stacks blockchain.
  */
 
-import { DurableObject } from "cloudflare:workers";
+import { fromHono } from "chanfana";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { loggerMiddleware, getLogger } from "./utils/logger";
+import type { Env, AppContext } from "./types";
+
+// Note: x402 middleware is applied via endpoint base classes (SimpleEndpoint, AIEndpoint, etc.)
+// Direct middleware imports available if needed: x402Simple, x402AI, x402StorageRead, etc.
+
+// Inference endpoints
+import { OpenRouterListModels, OpenRouterChat } from "./endpoints/inference/openrouter";
+import { CloudflareListModels, CloudflareChat } from "./endpoints/inference/cloudflare";
+
+// Stacks endpoints
 import {
-  OpenRouterClient,
-  OpenRouterError,
-  type ChatCompletionRequest,
-} from "./services/openrouter";
-import { x402PaymentMiddleware, getX402Context, type X402Context } from "./middleware/x402";
-import { logPnL } from "./utils/pricing";
-import { isValidStacksAddress } from "x402-stacks";
-import type {
-  Env,
-  AppVariables,
-  UsageRecord,
-  DailyStats,
-  AgentIdentity,
-  HealthResponse,
-} from "./types";
+  AddressConvert,
+  DecodeClarity,
+  DecodeTransaction,
+  Profile,
+  VerifyMessage,
+  VerifySIP018,
+} from "./endpoints/stacks";
 
-// =============================================================================
-// Constants
-// =============================================================================
+// Hashing endpoints
+import {
+  HashSha256,
+  HashSha512,
+  HashSha512_256,
+  HashKeccak256,
+  HashHash160,
+  HashRipemd160,
+} from "./endpoints/hashing";
 
-/** Margin added to OpenRouter costs (20% as decided) */
-const COST_MARGIN = 0.20;
+// Storage endpoints
+import {
+  KvGet,
+  KvSet,
+  KvDelete,
+  KvList,
+  PasteCreate,
+  PasteGet,
+  PasteDelete,
+  DbQuery,
+  DbExecute,
+  DbSchema,
+  SyncLock,
+  SyncUnlock,
+  SyncExtend,
+  SyncStatus,
+  SyncList,
+  QueuePush,
+  QueuePop,
+  QueuePeek,
+  QueueStatus,
+  QueueClear,
+  MemoryStore,
+  MemorySearch,
+  MemoryDelete,
+  MemoryList,
+  MemoryClear,
+} from "./endpoints/storage";
 
-// =============================================================================
-// Extended App Variables (includes x402 context)
-// =============================================================================
-
-type AppVarsWithX402 = AppVariables & { x402?: X402Context };
-
-// =============================================================================
-// OpenRouter Durable Object
-// =============================================================================
-
-/**
- * OpenRouter Durable Object
- *
- * Per-agent state for OpenRouter API access:
- * - Usage tracking (tokens, cost per request)
- * - Daily stats aggregation
- * - Rate limiting (TODO)
- *
- * Design follows Cloudflare "Rules of Durable Objects" (Dec 2025):
- * - One DO per agent (not a global singleton)
- * - SQLite storage (recommended over KV)
- * - RPC methods (not fetch handler)
- * - blockConcurrencyWhile() for initialization
- */
-export class OpenRouterDO extends DurableObject<Env> {
-  private sql: SqlStorage;
-
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    this.sql = ctx.storage.sql;
-
-    // Use blockConcurrencyWhile to prevent race conditions during schema init
-    // This ensures no requests are processed until schema is ready
-    ctx.blockConcurrencyWhile(async () => {
-      this.initSchema();
-    });
-  }
-
-  /**
-   * Initialize database schema
-   * Called in constructor via blockConcurrencyWhile
-   */
-  private initSchema(): void {
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS identity (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS usage (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        request_id TEXT NOT NULL,
-        model TEXT NOT NULL,
-        prompt_tokens INTEGER DEFAULT 0,
-        completion_tokens INTEGER DEFAULT 0,
-        cost_usd REAL DEFAULT 0,
-        timestamp TEXT DEFAULT (datetime('now'))
-      );
-
-      CREATE TABLE IF NOT EXISTS daily_stats (
-        date TEXT PRIMARY KEY,
-        total_requests INTEGER DEFAULT 0,
-        total_tokens INTEGER DEFAULT 0,
-        total_cost_usd REAL DEFAULT 0
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage(timestamp);
-      CREATE INDEX IF NOT EXISTS idx_usage_request_id ON usage(request_id);
-    `);
-  }
-
-  // ===========================================================================
-  // Identity Management (RPC methods)
-  // ===========================================================================
-
-  /**
-   * Initialize the DO with an agent ID
-   * Called once when first routing to this DO
-   * DOs don't know their own name/ID, so we store it explicitly
-   */
-  async init(agentId: string): Promise<AgentIdentity> {
-    try {
-      const existing = this.sql
-        .exec("SELECT value FROM identity WHERE key = 'agent_id'")
-        .toArray();
-
-      if (existing.length > 0) {
-        const createdAt = this.sql
-          .exec("SELECT value FROM identity WHERE key = 'created_at'")
-          .toArray();
-        return {
-          agentId: existing[0].value as string,
-          createdAt: createdAt[0]?.value as string,
-        };
-      }
-
-      const now = new Date().toISOString();
-      this.sql.exec(
-        "INSERT INTO identity (key, value) VALUES ('agent_id', ?)",
-        agentId
-      );
-      this.sql.exec(
-        "INSERT INTO identity (key, value) VALUES ('created_at', ?)",
-        now
-      );
-
-      return { agentId, createdAt: now };
-    } catch (error) {
-      console.error("[OpenRouterDO] Failed to init identity:", error);
-      throw error;
-    }
-  }
-
-  /**
-   * Get the agent's identity
-   */
-  async getIdentity(): Promise<AgentIdentity | null> {
-    try {
-      const agentId = this.sql
-        .exec("SELECT value FROM identity WHERE key = 'agent_id'")
-        .toArray();
-
-      if (agentId.length === 0) {
-        return null;
-      }
-
-      const createdAt = this.sql
-        .exec("SELECT value FROM identity WHERE key = 'created_at'")
-        .toArray();
-
-      return {
-        agentId: agentId[0].value as string,
-        createdAt: createdAt[0]?.value as string,
-      };
-    } catch (error) {
-      console.error("[OpenRouterDO] Failed to get identity:", error);
-      throw error;
-    }
-  }
-
-  // ===========================================================================
-  // Usage Tracking (RPC methods)
-  // ===========================================================================
-
-  /**
-   * Record usage for a request
-   */
-  async recordUsage(data: UsageRecord): Promise<void> {
-    try {
-      const today = new Date().toISOString().split("T")[0];
-
-      // Insert usage record
-      this.sql.exec(
-        `INSERT INTO usage (request_id, model, prompt_tokens, completion_tokens, cost_usd)
-         VALUES (?, ?, ?, ?, ?)`,
-        data.requestId,
-        data.model,
-        data.promptTokens,
-        data.completionTokens,
-        data.costUsd
-      );
-
-      // Update daily stats (atomic via write coalescing)
-      this.sql.exec(
-        `INSERT INTO daily_stats (date, total_requests, total_tokens, total_cost_usd)
-         VALUES (?, 1, ?, ?)
-         ON CONFLICT(date) DO UPDATE SET
-           total_requests = total_requests + 1,
-           total_tokens = total_tokens + excluded.total_tokens,
-           total_cost_usd = total_cost_usd + excluded.total_cost_usd`,
-        today,
-        data.promptTokens + data.completionTokens,
-        data.costUsd
-      );
-    } catch (error) {
-      console.error("[OpenRouterDO] Failed to record usage:", error);
-      throw error;
-    }
-  }
-
-  /**
-   * Get usage stats for the agent
-   */
-  async getStats(days: number = 7): Promise<DailyStats[]> {
-    try {
-      const result = this.sql.exec(
-        `SELECT date, total_requests, total_tokens, total_cost_usd
-         FROM daily_stats
-         ORDER BY date DESC
-         LIMIT ?`,
-        days
-      );
-
-      return result.toArray().map((row) => ({
-        date: row.date as string,
-        totalRequests: row.total_requests as number,
-        totalTokens: row.total_tokens as number,
-        totalCostUsd: row.total_cost_usd as number,
-      }));
-    } catch (error) {
-      console.error("[OpenRouterDO] Failed to get stats:", error);
-      throw error;
-    }
-  }
-
-  /**
-   * Get total usage across all time
-   */
-  async getTotalUsage(): Promise<{
-    totalRequests: number;
-    totalTokens: number;
-    totalCostUsd: number;
-  }> {
-    try {
-      const result = this.sql
-        .exec(
-          `SELECT
-            COALESCE(SUM(total_requests), 0) as total_requests,
-            COALESCE(SUM(total_tokens), 0) as total_tokens,
-            COALESCE(SUM(total_cost_usd), 0) as total_cost_usd
-           FROM daily_stats`
-        )
-        .toArray();
-
-      const row = result[0];
-      return {
-        totalRequests: row?.total_requests as number ?? 0,
-        totalTokens: row?.total_tokens as number ?? 0,
-        totalCostUsd: row?.total_cost_usd as number ?? 0,
-      };
-    } catch (error) {
-      console.error("[OpenRouterDO] Failed to get total usage:", error);
-      throw error;
-    }
-  }
-
-  /**
-   * Get recent usage records
-   */
-  async getRecentUsage(limit: number = 10): Promise<
-    Array<{
-      requestId: string;
-      model: string;
-      promptTokens: number;
-      completionTokens: number;
-      costUsd: number;
-      timestamp: string;
-    }>
-  > {
-    try {
-      const result = this.sql.exec(
-        `SELECT request_id, model, prompt_tokens, completion_tokens, cost_usd, timestamp
-         FROM usage
-         ORDER BY timestamp DESC
-         LIMIT ?`,
-        limit
-      );
-
-      return result.toArray().map((row) => ({
-        requestId: row.request_id as string,
-        model: row.model as string,
-        promptTokens: row.prompt_tokens as number,
-        completionTokens: row.completion_tokens as number,
-        costUsd: row.cost_usd as number,
-        timestamp: row.timestamp as string,
-      }));
-    } catch (error) {
-      console.error("[OpenRouterDO] Failed to get recent usage:", error);
-      throw error;
-    }
-  }
-}
+// Durable Objects
+export { UsageDO } from "./durable-objects/UsageDO";
+export { StorageDO } from "./durable-objects/StorageDO";
 
 // =============================================================================
 // Hono App
 // =============================================================================
 
-const app = new Hono<{ Bindings: Env; Variables: AppVarsWithX402 }>();
+const app = new Hono<{ Bindings: Env }>();
 
 // CORS middleware
 app.use(
   "*",
   cors({
     origin: "*",
-    allowMethods: ["GET", "POST", "OPTIONS"],
-    allowHeaders: ["X-PAYMENT", "X-PAYMENT-TOKEN-TYPE", "Authorization", "X-Agent-ID", "X-Stacks-Address", "Content-Type"],
+    allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowHeaders: [
+      "X-PAYMENT",
+      "X-PAYMENT-TOKEN-TYPE",
+      "Authorization",
+      "Content-Type",
+    ],
     exposeHeaders: ["X-PAYMENT-RESPONSE", "X-PAYER-ADDRESS", "X-Request-ID"],
   })
 );
 
-// Logger middleware - creates logger with CF-Ray ID
-app.use("*", loggerMiddleware);
+// =============================================================================
+// chanfana OpenAPI Registry
+// =============================================================================
+
+const openapi = fromHono(app, {
+  docs_url: "/docs",
+  schema: {
+    info: {
+      title: "x402 Stacks API",
+      version: "1.0.0",
+      description: `
+Pay-per-use API powered by x402 protocol on Stacks blockchain.
+
+## Payment
+All paid endpoints require an \`X-PAYMENT\` header with a signed Stacks transaction.
+Optionally specify token via \`X-PAYMENT-TOKEN-TYPE\` (STX, sBTC, USDCx).
+
+## Pricing Tiers
+| Tier | STX | Description |
+|------|-----|-------------|
+| free | 0 | No payment required |
+| simple | 0.001 | Basic compute (hashing, conversion) |
+| ai | 0.003 | AI-enhanced operations |
+| storage_read | 0.001 | Read from storage |
+| storage_write | 0.002 | Write to storage |
+| storage_write_large | 0.005 | Large writes (embeddings) |
+| dynamic | varies | LLM costs + 20% margin |
+      `.trim(),
+    },
+    tags: [
+      { name: "Info", description: "Service information" },
+      { name: "Inference - OpenRouter", description: "OpenRouter LLM API (100+ models)" },
+      { name: "Inference - Cloudflare", description: "Cloudflare AI models" },
+      { name: "Stacks", description: "Stacks blockchain utilities" },
+      { name: "Hashing", description: "Clarity-compatible hashing functions" },
+      { name: "Storage - KV", description: "Key-value storage" },
+      { name: "Storage - Paste", description: "Text paste bin" },
+      { name: "Storage - DB", description: "SQL database" },
+      { name: "Storage - Sync", description: "Distributed locks" },
+      { name: "Storage - Queue", description: "Job queue" },
+      { name: "Storage - Memory", description: "Vector memory with embeddings" },
+    ],
+    servers: [
+      { url: "https://x402.aibtc.com", description: "Production (mainnet)" },
+      { url: "https://x402.aibtc.dev", description: "Staging (testnet)" },
+    ],
+  },
+});
 
 // =============================================================================
-// Health & Info Endpoints
+// Info Endpoints
 // =============================================================================
 
 app.get("/", (c) => {
   return c.json({
-    service: "x402-api-host",
-    version: "0.1.0",
-    description: "x402 micropayment-gated API proxies",
-    services: {
-      openrouter: {
-        description: "OpenRouter LLM API (100+ models)",
-        endpoints: {
-          "GET /openrouter/v1/models": "List available models",
-          "POST /openrouter/v1/chat/completions": "Chat completions (x402 paid)",
-          "GET /openrouter/usage": "Usage stats (requires Stacks address)",
-        },
-      },
+    service: "x402-stacks-api",
+    version: "1.0.0",
+    description: "Pay-per-use API powered by x402 protocol on Stacks blockchain",
+    docs: "/docs",
+    categories: {
+      inference: "/inference/* - LLM chat completions",
+      stacks: "/stacks/* - Blockchain utilities",
+      hashing: "/hashing/* - Clarity-compatible hashing",
+      storage: "/storage/* - Stateful operations (KV, paste, DB, sync, queue, memory)",
     },
-    endpoints: {
-      "GET /health": "Health check",
+    payment: {
+      tokens: ["STX", "sBTC", "USDCx"],
+      header: "X-PAYMENT",
+      tokenTypeHeader: "X-PAYMENT-TOKEN-TYPE",
     },
   });
 });
 
 app.get("/health", (c) => {
-  const log = getLogger(c);
-  log.debug("Health check requested");
-
-  const response: HealthResponse = {
+  return c.json({
     status: "ok",
     environment: c.env.ENVIRONMENT,
-    services: ["openrouter"],
-  };
-
-  return c.json(response);
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // =============================================================================
-// Helper Functions
+// Inference Routes
 // =============================================================================
 
-/**
- * Get DO stub for an agent
- * Uses Stacks address as the DO key
- * Returns typed stub for RPC method calls
- */
-function getAgentDO(env: Env, agentId: string): DurableObjectStub<OpenRouterDO> {
-  const id = env.OPENROUTER_DO.idFromName(agentId);
-  return env.OPENROUTER_DO.get(id) as DurableObjectStub<OpenRouterDO>;
-}
+// OpenRouter (free list, dynamic chat)
+openapi.get("/inference/openrouter/models", OpenRouterListModels);
+openapi.post("/inference/openrouter/chat", OpenRouterChat);
 
-/**
- * Extract agent ID from request
- * TODO: Get from x402 payment header once implemented
- * For now, uses X-Agent-ID header for testing
- */
-function getAgentId(c: { req: { header: (name: string) => string | undefined } }): string | null {
-  // Check for x402 payment header (future)
-  // const paymentHeader = c.req.header("X-PAYMENT");
-  // if (paymentHeader) { extract payer address }
-
-  // For testing: use X-Agent-ID header
-  const agentId = c.req.header("X-Agent-ID");
-  return agentId || null;
-}
+// Cloudflare AI (free list, ai tier chat)
+openapi.get("/inference/cloudflare/models", CloudflareListModels);
+openapi.post("/inference/cloudflare/chat", CloudflareChat);
 
 // =============================================================================
-// OpenRouter Proxy Endpoints
+// Stacks Routes (simple tier)
 // =============================================================================
 
-app.get("/openrouter/v1/models", async (c) => {
-  const log = getLogger(c);
-
-  log.info("Models list requested");
-
-  try {
-    // Check for API key
-    if (!c.env.OPENROUTER_API_KEY) {
-      log.error("OPENROUTER_API_KEY not configured");
-      return c.json(
-        { error: "Service not configured" },
-        { status: 503 }
-      );
-    }
-
-    const client = new OpenRouterClient(c.env.OPENROUTER_API_KEY, log);
-    const models = await client.getModels();
-
-    log.info("Models fetched successfully", { count: models.data.length });
-
-    return c.json(models);
-  } catch (error) {
-    if (error instanceof OpenRouterError) {
-      log.error("OpenRouter error fetching models", {
-        status: error.status,
-        details: error.details,
-      });
-      const status = error.status >= 500 ? 502 : error.status;
-      return c.json({ error: error.message }, status as 400 | 401 | 402 | 403 | 404 | 429 | 502);
-    }
-
-    log.error("Failed to fetch models", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-
-    return c.json(
-      { error: "Internal server error" },
-      { status: 500 }
-    );
-  }
-});
-
-app.post("/openrouter/v1/chat/completions", x402PaymentMiddleware(), async (c) => {
-  const log = getLogger(c);
-  const requestId = c.get("requestId");
-
-  log.info("Chat completion request received (x402 verified)");
-
-  try {
-    // Check for API key
-    if (!c.env.OPENROUTER_API_KEY) {
-      log.error("OPENROUTER_API_KEY not configured");
-      return c.json(
-        { error: "Service not configured", request_id: requestId },
-        { status: 503 }
-      );
-    }
-
-    // Get x402 context (set by middleware after payment verification)
-    const x402 = getX402Context(c);
-    if (!x402) {
-      // This shouldn't happen - middleware should have returned 402
-      log.error("x402 context not found after middleware");
-      return c.json(
-        { error: "Payment verification failed", request_id: requestId },
-        { status: 500 }
-      );
-    }
-
-    // Get body from x402 context (middleware already parsed and validated)
-    const body = x402.parsedBody;
-    const agentId = x402.payerAddress;
-
-    // Validate required fields (middleware validates for pricing, but double-check)
-    if (!body.model) {
-      return c.json(
-        { error: "Missing required field: model", request_id: requestId },
-        { status: 400 }
-      );
-    }
-    if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
-      return c.json(
-        { error: "Missing required field: messages", request_id: requestId },
-        { status: 400 }
-      );
-    }
-
-    log.info("Processing chat completion", {
-      model: body.model,
-      messageCount: body.messages.length,
-      stream: body.stream,
-      agentId,
-      tokenType: x402.priceEstimate.tokenType,
-      estimatedCostUsd: x402.priceEstimate.costWithMarginUsd.toFixed(6),
-    });
-
-    // Create OpenRouter client
-    const client = new OpenRouterClient(c.env.OPENROUTER_API_KEY, log);
-
-    // Handle streaming vs non-streaming
-    if (body.stream) {
-      // Streaming response with usage tracking
-      const { stream, model, usagePromise } = await client.createChatCompletionStream(body);
-
-      log.info("Streaming response started", { model, agentId });
-
-      // Track usage after stream completes (non-blocking)
-      c.executionCtx.waitUntil(
-        usagePromise.then(async (usage) => {
-          if (!usage) {
-            log.warn("No usage data from stream", { model, agentId });
-            return;
-          }
-
-          // Calculate cost with margin
-          const totalCost = usage.estimatedCostUsd * (1 + COST_MARGIN);
-
-          log.info("Streaming completion finished", {
-            model: usage.model,
-            promptTokens: usage.promptTokens,
-            completionTokens: usage.completionTokens,
-            actualCostUsd: usage.estimatedCostUsd,
-            totalCostWithMargin: totalCost,
-            agentId,
-          });
-
-          // Log PnL (estimated vs actual costs)
-          logPnL(
-            x402.priceEstimate,
-            usage.estimatedCostUsd,
-            usage.promptTokens,
-            usage.completionTokens,
-            log
-          );
-
-          // Record usage in agent's DO
-          try {
-            const stub = getAgentDO(c.env, agentId);
-            await stub.init(agentId);
-            const usageRecord: UsageRecord = {
-              requestId,
-              model: usage.model,
-              promptTokens: usage.promptTokens,
-              completionTokens: usage.completionTokens,
-              costUsd: totalCost,
-            };
-            await stub.recordUsage(usageRecord);
-            log.debug("Streaming usage recorded in DO", { agentId, requestId });
-          } catch (doError) {
-            log.error("Failed to record streaming usage in DO", {
-              error: doError instanceof Error ? doError.message : String(doError),
-              agentId,
-            });
-          }
-        }).catch((err) => {
-          log.error("Error tracking streaming usage", {
-            error: err instanceof Error ? err.message : String(err),
-            agentId,
-          });
-        })
-      );
-
-      return new Response(stream, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive",
-          "X-Request-ID": requestId,
-          "X-PAYER-ADDRESS": agentId,
-        },
-      });
-    } else {
-      // Non-streaming response
-      const { response, usage } = await client.createChatCompletion(body);
-
-      // Calculate cost with margin
-      const totalCost = usage.estimatedCostUsd * (1 + COST_MARGIN);
-
-      log.info("Chat completion successful", {
-        model: usage.model,
-        promptTokens: usage.promptTokens,
-        completionTokens: usage.completionTokens,
-        actualCostUsd: usage.estimatedCostUsd,
-        totalCostWithMargin: totalCost,
-        agentId,
-      });
-
-      // Log PnL (estimated vs actual costs)
-      logPnL(
-        x402.priceEstimate,
-        usage.estimatedCostUsd,
-        usage.promptTokens,
-        usage.completionTokens,
-        log
-      );
-
-      // Record usage in agent's DO
-      try {
-        const stub = getAgentDO(c.env, agentId);
-
-        // Initialize agent if first request
-        await stub.init(agentId);
-
-        // Record usage
-        const usageRecord: UsageRecord = {
-          requestId,
-          model: usage.model,
-          promptTokens: usage.promptTokens,
-          completionTokens: usage.completionTokens,
-          costUsd: totalCost,
-        };
-        await stub.recordUsage(usageRecord);
-
-        log.debug("Usage recorded in DO", { agentId, requestId });
-      } catch (doError) {
-        // Log but don't fail the request if DO recording fails
-        log.error("Failed to record usage in DO", {
-          error: doError instanceof Error ? doError.message : String(doError),
-          agentId,
-        });
-      }
-
-      return c.json(response);
-    }
-  } catch (error) {
-    if (error instanceof OpenRouterError) {
-      log.error("OpenRouter error", {
-        status: error.status,
-        details: error.details,
-        retryable: error.retryable,
-      });
-
-      // Map OpenRouter errors to appropriate status codes
-      const statusCode = (error.status >= 500 ? 502 : error.status) as 400 | 401 | 402 | 403 | 404 | 429 | 502;
-      return c.json(
-        {
-          error: error.message,
-          request_id: requestId,
-          retryable: error.retryable,
-        },
-        statusCode
-      );
-    }
-
-    log.error("Chat completion failed", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-
-    return c.json(
-      {
-        error: "Internal server error",
-        request_id: requestId,
-      },
-      { status: 500 }
-    );
-  }
-});
+openapi.get("/stacks/address/:address", AddressConvert);
+openapi.post("/stacks/decode/clarity", DecodeClarity);
+openapi.post("/stacks/decode/transaction", DecodeTransaction);
+openapi.get("/stacks/profile/:address", Profile);
+openapi.post("/stacks/verify/message", VerifyMessage);
+openapi.post("/stacks/verify/sip018", VerifySIP018);
 
 // =============================================================================
-// Usage Stats Endpoint
+// Hashing Routes (simple tier)
 // =============================================================================
 
-app.get("/openrouter/usage", async (c) => {
-  const log = getLogger(c);
-
-  log.info("Usage stats requested");
-
-  try {
-    // Get Stacks address from header
-    // Note: For production, this should require a signed message to prove ownership
-    // For MVP, we validate address format only (usage stats aren't sensitive)
-    const agentId = c.req.header("X-Stacks-Address") || c.req.header("X-Agent-ID");
-
-    if (!agentId) {
-      return c.json(
-        {
-          error: "Missing Stacks address",
-          hint: "Provide your Stacks address in the X-Stacks-Address header",
-        },
-        { status: 401 }
-      );
-    }
-
-    // Validate Stacks address format
-    if (!isValidStacksAddress(agentId)) {
-      return c.json(
-        {
-          error: "Invalid Stacks address format",
-          hint: "Address should start with SP (mainnet) or ST (testnet)",
-        },
-        { status: 400 }
-      );
-    }
-
-    log.debug("Fetching usage for agent", { agentId });
-
-    // Get agent's DO
-    const stub = getAgentDO(c.env, agentId);
-
-    // Fetch stats
-    const [identity, dailyStats, totalUsage, recentUsage] = await Promise.all([
-      stub.getIdentity(),
-      stub.getStats(30), // Last 30 days
-      stub.getTotalUsage(),
-      stub.getRecentUsage(20), // Last 20 requests
-    ]);
-
-    log.info("Usage stats fetched", {
-      agentId,
-      totalRequests: totalUsage.totalRequests,
-    });
-
-    return c.json({
-      ok: true,
-      data: {
-        agent: identity,
-        totals: totalUsage,
-        dailyStats,
-        recentRequests: recentUsage,
-      },
-    });
-  } catch (error) {
-    log.error("Failed to get usage stats", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-
-    return c.json(
-      { ok: false, error: "Internal server error" },
-      { status: 500 }
-    );
-  }
-});
+openapi.post("/hashing/sha256", HashSha256);
+openapi.post("/hashing/sha512", HashSha512);
+openapi.post("/hashing/sha512-256", HashSha512_256);
+openapi.post("/hashing/keccak256", HashKeccak256);
+openapi.post("/hashing/hash160", HashHash160);
+openapi.post("/hashing/ripemd160", HashRipemd160);
 
 // =============================================================================
-// Error Handler
+// Storage Routes
+// =============================================================================
+
+// KV (read/write tiers)
+openapi.get("/storage/kv/:key", KvGet);
+openapi.post("/storage/kv", KvSet);
+openapi.delete("/storage/kv/:key", KvDelete);
+openapi.get("/storage/kv", KvList);
+
+// Paste (read/write tiers)
+openapi.post("/storage/paste", PasteCreate);
+openapi.get("/storage/paste/:id", PasteGet);
+openapi.delete("/storage/paste/:id", PasteDelete);
+
+// DB (read/write tiers)
+openapi.post("/storage/db/query", DbQuery);
+openapi.post("/storage/db/execute", DbExecute);
+openapi.get("/storage/db/schema", DbSchema);
+
+// Sync/Locks (read/write tiers)
+openapi.post("/storage/sync/lock", SyncLock);
+openapi.post("/storage/sync/unlock", SyncUnlock);
+openapi.post("/storage/sync/extend", SyncExtend);
+openapi.get("/storage/sync/status/:name", SyncStatus);
+openapi.get("/storage/sync/list", SyncList);
+
+// Queue (read/write tiers)
+openapi.post("/storage/queue/push", QueuePush);
+openapi.post("/storage/queue/pop", QueuePop);
+openapi.get("/storage/queue/peek", QueuePeek);
+openapi.get("/storage/queue/status", QueueStatus);
+openapi.post("/storage/queue/clear", QueueClear);
+
+// Memory/Vector (read/write_large tiers)
+openapi.post("/storage/memory/store", MemoryStore);
+openapi.post("/storage/memory/search", MemorySearch);
+openapi.post("/storage/memory/delete", MemoryDelete);
+openapi.get("/storage/memory/list", MemoryList);
+openapi.post("/storage/memory/clear", MemoryClear);
+
+// =============================================================================
+// Error Handling
 // =============================================================================
 
 app.onError((err, c) => {
-  const log = getLogger(c);
-  const requestId = c.get("requestId") || "unknown";
-
-  log.error("Unhandled error", {
-    error: err.message,
-    stack: err.stack,
-  });
-
+  console.error("Unhandled error:", err);
   return c.json(
     {
       ok: false,
       error: "Internal server error",
-      requestId,
+      message: err.message,
     },
-    { status: 500 }
+    500
   );
 });
 
-// =============================================================================
-// 404 Handler
-// =============================================================================
-
 app.notFound((c) => {
-  const log = getLogger(c);
-  log.warn("Route not found", { path: c.req.path });
-
   return c.json(
     {
       ok: false,
       error: "Not found",
       path: c.req.path,
+      hint: "Visit /docs for API documentation",
     },
-    { status: 404 }
+    404
   );
 });
 

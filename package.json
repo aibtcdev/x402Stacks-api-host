@@ -1,6 +1,6 @@
 {
-  "name": "x402stacks-api-host",
-  "version": "0.0.1",
+  "name": "x402-api",
+  "version": "0.1.0",
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
@@ -16,9 +16,13 @@
     "wrangler": "^4.58.0"
   },
   "dependencies": {
+    "@stacks/encryption": "^7.3.1",
     "@stacks/transactions": "^7.3.1",
+    "chanfana": "^3.0.0",
     "hono": "^4.11.3",
     "openai": "^6.15.0",
-    "x402-stacks": "^1.1.1"
+    "qrcode": "^1.5.4",
+    "x402-stacks": "^1.1.1",
+    "zod": "^3.24.1"
   }
 }

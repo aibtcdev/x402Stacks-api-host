@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "x402stacks-api-host",
+  "name": "x402-api",
   "main": "src/index.ts",
   "compatibility_date": "2025-01-08",
   // nodejs_compat_v2 includes RPC support for service bindings
@@ -24,26 +24,54 @@
     }
   ],
   /**
+   * KV Namespaces
+   * METRICS: Usage metrics storage
+   * STORAGE: General key-value storage for agents
+   */
+  "kv_namespaces": [
+    {
+      "binding": "METRICS",
+      "id": "TBD_METRICS_ID"
+    },
+    {
+      "binding": "STORAGE",
+      "id": "TBD_STORAGE_ID"
+    }
+  ],
+  /**
+   * AI Binding
+   * Used for Cloudflare AI inference endpoints and embeddings
+   */
+  "ai": {
+    "binding": "AI"
+  },
+  /**
    * Durable Objects
-   * One DO class per API service for isolated state/rate limiting
+   * USAGE_DO: Per-payer usage tracking for dashboard
+   * STORAGE_DO: Per-payer stateful storage (KV, paste, db, sync, queue, memory)
    */
   "durable_objects": {
     "bindings": [
       {
-        "name": "OPENROUTER_DO",
-        "class_name": "OpenRouterDO"
+        "name": "USAGE_DO",
+        "class_name": "UsageDO"
+      },
+      {
+        "name": "STORAGE_DO",
+        "class_name": "StorageDO"
       }
     ]
   },
   /**
    * DO Migrations
-   * Use new_sqlite_classes for SQLite-backed DOs (usage tracking, rate limits)
+   * Use new_sqlite_classes for SQLite-backed DOs (usage tracking, storage)
    */
   "migrations": [
     {
       "tag": "v1",
       "new_sqlite_classes": [
-        "OpenRouterDO"
+        "UsageDO",
+        "StorageDO"
       ]
     }
   ],
@@ -51,6 +79,7 @@
    * Environment Variables
    * Secrets should be set via `wrangler secret put`:
    * - OPENROUTER_API_KEY: API key for OpenRouter
+   * - HIRO_API_KEY: API key for Hiro (better rate limits)
    */
   "vars": {
     "ENVIRONMENT": "development",

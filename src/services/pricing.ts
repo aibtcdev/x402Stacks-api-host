@@ -1,40 +1,26 @@
 /**
- * Pricing Utility for x402 Payments
+ * Pricing Service
  *
- * Estimates cost based on model pricing and input tokens.
- * Used to calculate pre-payment amount for x402.
+ * Central pricing configuration for all endpoints.
+ * Supports both fixed tiers and dynamic pricing for LLM endpoints.
  */
 
 import { STXtoMicroSTX, BTCtoSats, USDCxToMicroUSDCx } from "x402-stacks";
-import type { Logger, ChatCompletionRequest } from "../types";
-
-// =============================================================================
-// Types
-// =============================================================================
-
-export type TokenType = "STX" | "sBTC" | "USDCx";
-
-export interface ModelPricing {
-  promptPer1k: number; // USD per 1K prompt tokens
-  completionPer1k: number; // USD per 1K completion tokens
-}
-
-export interface PriceEstimate {
-  estimatedInputTokens: number;
-  estimatedOutputTokens: number;
-  estimatedCostUsd: number;
-  costWithMarginUsd: number;
-  amountInToken: bigint;
-  tokenType: TokenType;
-  model: string;
-}
+import type {
+  TokenType,
+  PricingTier,
+  PriceEstimate,
+  TierPricing,
+  ChatCompletionRequest,
+  Logger,
+} from "../types";
 
 // =============================================================================
 // Constants
 // =============================================================================
 
 /** Margin added to OpenRouter costs (20% as decided) */
-const COST_MARGIN = 0.20;
+export const COST_MARGIN = 0.20;
 
 /** Buffer for output tokens when estimating (assume 2x input for safety) */
 const OUTPUT_TOKEN_MULTIPLIER = 2;
@@ -44,6 +30,66 @@ const MIN_PAYMENT_USD = 0.001;
 
 /** Approximate tokens per character (conservative estimate) */
 const TOKENS_PER_CHAR = 0.25;
+
+// =============================================================================
+// Fixed Tier Pricing
+// =============================================================================
+
+/**
+ * Fixed pricing tiers in STX
+ * These are the base prices - USD equivalents are for display only
+ */
+export const TIER_PRICING: Record<PricingTier, TierPricing> = {
+  free: {
+    stx: 0,
+    usd: 0,
+    description: "Free endpoint",
+  },
+  simple: {
+    stx: 0.001,
+    usd: 0.0005,
+    description: "Basic compute (hashing, conversion)",
+  },
+  ai: {
+    stx: 0.003,
+    usd: 0.0015,
+    description: "AI-enhanced operations",
+  },
+  heavy_ai: {
+    stx: 0.01,
+    usd: 0.005,
+    description: "Heavy AI workloads",
+  },
+  storage_read: {
+    stx: 0.001,
+    usd: 0.0005,
+    description: "Read from storage",
+  },
+  storage_write: {
+    stx: 0.002,
+    usd: 0.001,
+    description: "Write to storage",
+  },
+  storage_write_large: {
+    stx: 0.005,
+    usd: 0.0025,
+    description: "Large writes (paste, memory)",
+  },
+  dynamic: {
+    stx: 0,
+    usd: 0,
+    description: "Dynamic pricing based on usage",
+  },
+};
+
+// =============================================================================
+// Model Pricing (for dynamic LLM pricing)
+// =============================================================================
+
+export interface ModelPricing {
+  promptPer1k: number;      // USD per 1K prompt tokens
+  completionPer1k: number;  // USD per 1K completion tokens
+}
 
 /**
  * Model pricing in USD per 1K tokens
@@ -77,23 +123,27 @@ const MODEL_PRICING: Record<string, ModelPricing> = {
 };
 
 /** Default pricing for unknown models (conservative/high estimate) */
-const DEFAULT_PRICING: ModelPricing = {
+const DEFAULT_MODEL_PRICING: ModelPricing = {
   promptPer1k: 0.01,
   completionPer1k: 0.03,
 };
+
+// =============================================================================
+// Token Exchange Rates
+// =============================================================================
 
 /**
  * Token exchange rates (approximate, for converting USD to tokens)
  * Updated periodically based on market rates
  */
 const TOKEN_RATES: Record<TokenType, number> = {
-  STX: 0.50, // 1 STX ≈ $0.50 USD
-  sBTC: 100000, // 1 sBTC ≈ $100,000 USD
-  USDCx: 1.0, // 1 USDCx = $1 USD (Circle USDC via xReserve)
+  STX: 0.50,      // 1 STX ≈ $0.50 USD
+  sBTC: 100000,   // 1 sBTC ≈ $100,000 USD
+  USDCx: 1.0,     // 1 USDCx = $1 USD (Circle USDC via xReserve)
 };
 
 // =============================================================================
-// Functions
+// Public Functions
 // =============================================================================
 
 /**
@@ -131,7 +181,7 @@ export function getModelPricing(model: string): ModelPricing {
     return { promptPer1k: 0.0002, completionPer1k: 0.0002 };
   }
 
-  return DEFAULT_PRICING;
+  return DEFAULT_MODEL_PRICING;
 }
 
 /**
@@ -165,7 +215,6 @@ export function usdToTokenAmount(usd: number, tokenType: TokenType): bigint {
     case "sBTC":
       return BTCtoSats(tokenAmount);
     case "USDCx":
-      // USDCx has 6 decimals (Circle USDC via xReserve)
       return USDCxToMicroUSDCx(tokenAmount);
     default:
       throw new Error(`Unknown token type: ${tokenType}`);
@@ -173,9 +222,47 @@ export function usdToTokenAmount(usd: number, tokenType: TokenType): bigint {
 }
 
 /**
- * Estimate payment amount for a chat completion request
+ * Convert STX amount to token amount (for fixed tiers)
  */
-export function estimatePaymentAmount(
+export function stxToTokenAmount(stx: number, tokenType: TokenType): bigint {
+  // Convert STX to USD first, then to target token
+  const usd = stx * TOKEN_RATES.STX;
+  return usdToTokenAmount(usd, tokenType);
+}
+
+/**
+ * Get price estimate for a fixed tier
+ */
+export function getFixedTierEstimate(tier: PricingTier, tokenType: TokenType): PriceEstimate {
+  const tierPricing = TIER_PRICING[tier];
+
+  // For free tier, return zero
+  if (tier === "free") {
+    return {
+      estimatedCostUsd: 0,
+      costWithMarginUsd: 0,
+      amountInToken: BigInt(0),
+      tokenType,
+      tier,
+    };
+  }
+
+  const stxAmount = tierPricing.stx;
+  const amountInToken = stxToTokenAmount(stxAmount, tokenType);
+
+  return {
+    estimatedCostUsd: tierPricing.usd,
+    costWithMarginUsd: tierPricing.usd,
+    amountInToken,
+    tokenType,
+    tier,
+  };
+}
+
+/**
+ * Estimate payment amount for a chat completion request (dynamic pricing)
+ */
+export function estimateChatPayment(
   request: ChatCompletionRequest,
   tokenType: TokenType,
   log?: Logger
@@ -210,9 +297,9 @@ export function estimatePaymentAmount(
     amountInToken,
     tokenType,
     model: request.model,
+    tier: "dynamic",
   };
 
-  // Log for PnL tracking
   if (log) {
     log.debug("Price estimate calculated", {
       model: request.model,
@@ -262,7 +349,7 @@ export function logPnL(
 }
 
 /**
- * Validate token type
+ * Validate token type string and return typed value
  */
 export function validateTokenType(tokenTypeStr: string): TokenType {
   const upper = tokenTypeStr.toUpperCase();
@@ -278,4 +365,18 @@ export function validateTokenType(tokenTypeStr: string): TokenType {
   }
 
   throw new Error(`Invalid tokenType: ${tokenTypeStr}. Supported: STX, sBTC, USDCx`);
+}
+
+/**
+ * Estimate cost from actual usage (for cost tracking after completion)
+ */
+export function estimateActualCost(
+  promptTokens: number,
+  completionTokens: number,
+  model: string
+): number {
+  const pricing = getModelPricing(model);
+  const promptCost = (promptTokens / 1000) * pricing.promptPer1k;
+  const completionCost = (completionTokens / 1000) * pricing.completionPer1k;
+  return promptCost + completionCost;
 }

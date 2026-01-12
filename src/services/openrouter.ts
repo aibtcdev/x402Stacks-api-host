@@ -7,7 +7,8 @@
  * API Reference: https://openrouter.ai/docs/api/reference/overview
  */
 
-import type { Logger } from "../types";
+import type { Logger, ChatCompletionRequest, ChatCompletionResponse, ModelsResponse, UsageInfo } from "../types";
+import { estimateActualCost } from "./pricing";
 
 // =============================================================================
 // Constants
@@ -15,95 +16,11 @@ import type { Logger } from "../types";
 
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 const APP_REFERER = "https://aibtc.dev";
-const APP_TITLE = "x402 Stacks API Host";
+const APP_TITLE = "x402 API";
 
 // =============================================================================
 // Types
 // =============================================================================
-
-/** OpenRouter chat completion request */
-export interface ChatCompletionRequest {
-  model: string;
-  messages: Array<{
-    role: "system" | "user" | "assistant" | "tool";
-    content: string;
-    name?: string;
-    tool_calls?: unknown[];
-    tool_call_id?: string;
-  }>;
-  temperature?: number;
-  top_p?: number;
-  max_tokens?: number;
-  stream?: boolean;
-  /** OpenRouter stream options for usage tracking */
-  stream_options?: {
-    include_usage?: boolean;
-  };
-  stop?: string | string[];
-  presence_penalty?: number;
-  frequency_penalty?: number;
-  tools?: unknown[];
-  tool_choice?: unknown;
-  response_format?: { type: "text" | "json_object" };
-}
-
-/** OpenRouter chat completion response (non-streaming) */
-export interface ChatCompletionResponse {
-  id: string;
-  object: "chat.completion";
-  created: number;
-  model: string;
-  choices: Array<{
-    index: number;
-    message: {
-      role: "assistant";
-      content: string | null;
-      tool_calls?: unknown[];
-    };
-    finish_reason: "stop" | "length" | "tool_calls" | "content_filter" | null;
-  }>;
-  usage?: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-  };
-}
-
-/** OpenRouter model info */
-export interface OpenRouterModel {
-  id: string;
-  name: string;
-  description?: string;
-  context_length: number;
-  pricing: {
-    prompt: string; // Cost per token as string (e.g., "0.000001")
-    completion: string;
-    image?: string;
-    request?: string;
-  };
-  top_provider?: {
-    max_completion_tokens?: number;
-    is_moderated?: boolean;
-  };
-  per_request_limits?: {
-    prompt_tokens?: number;
-    completion_tokens?: number;
-  };
-}
-
-/** OpenRouter models list response */
-export interface ModelsResponse {
-  data: OpenRouterModel[];
-}
-
-/** Usage info extracted from response */
-export interface UsageInfo {
-  model: string;
-  promptTokens: number;
-  completionTokens: number;
-  totalTokens: number;
-  estimatedCostUsd: number;
-}
 
 /** Streaming chunk with optional usage (in final chunk) */
 export interface StreamingChunk {
@@ -200,7 +117,6 @@ export class OpenRouterClient {
       messageCount: request.messages.length,
     });
 
-    // Force non-streaming for now
     const payload = { ...request, stream: false };
 
     const response = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
@@ -224,8 +140,6 @@ export class OpenRouterClient {
     }
 
     const data = (await response.json()) as ChatCompletionResponse;
-
-    // Extract usage info
     const usage = this.extractUsage(data, request.model);
 
     this.log.info("Chat completion successful", {
@@ -240,8 +154,6 @@ export class OpenRouterClient {
 
   /**
    * Create a streaming chat completion
-   * Returns a ReadableStream that can be piped to the client,
-   * plus a promise that resolves with usage info after stream completes
    */
   async createChatCompletionStream(
     request: ChatCompletionRequest
@@ -251,7 +163,6 @@ export class OpenRouterClient {
       messageCount: request.messages.length,
     });
 
-    // Enable usage tracking in the stream
     const payload = {
       ...request,
       stream: true,
@@ -284,14 +195,12 @@ export class OpenRouterClient {
 
     this.log.debug("Streaming response started", { model: request.model });
 
-    // Create usage capture variables
     let capturedUsage: UsageInfo | null = null;
     let usageResolve: (usage: UsageInfo | null) => void;
     const usagePromise = new Promise<UsageInfo | null>((resolve) => {
       usageResolve = resolve;
     });
 
-    // Create a transform stream that captures usage from final chunk
     const transformStream = this.createUsageCapturingStream(
       response.body,
       request.model,
@@ -306,7 +215,6 @@ export class OpenRouterClient {
         usageResolve(usage);
       },
       () => {
-        // Stream ended without usage (shouldn't happen with include_usage: true)
         if (!capturedUsage) {
           this.log.warn("Stream ended without usage data");
           usageResolve(null);
@@ -332,7 +240,6 @@ export class OpenRouterClient {
     onComplete: () => void
   ): ReadableStream {
     const log = this.log;
-    const estimateCost = this.estimateCost.bind(this);
     let buffer = "";
 
     return new ReadableStream({
@@ -345,7 +252,6 @@ export class OpenRouterClient {
             const { done, value } = await reader.read();
 
             if (done) {
-              // Flush any remaining buffer
               if (buffer.trim()) {
                 controller.enqueue(new TextEncoder().encode(buffer));
               }
@@ -354,13 +260,11 @@ export class OpenRouterClient {
               break;
             }
 
-            // Decode and pass through
             const text = decoder.decode(value, { stream: true });
             buffer += text;
 
-            // Parse SSE events to find usage
             const lines = buffer.split("\n");
-            buffer = lines.pop() || ""; // Keep incomplete line in buffer
+            buffer = lines.pop() || "";
 
             for (const line of lines) {
               if (line.startsWith("data: ")) {
@@ -373,14 +277,13 @@ export class OpenRouterClient {
                 try {
                   const chunk = JSON.parse(data) as StreamingChunk;
 
-                  // Check for usage in final chunk
                   if (chunk.usage) {
                     const usage: UsageInfo = {
                       model: chunk.model || requestModel,
                       promptTokens: chunk.usage.prompt_tokens,
                       completionTokens: chunk.usage.completion_tokens,
                       totalTokens: chunk.usage.total_tokens,
-                      estimatedCostUsd: estimateCost(
+                      estimatedCostUsd: estimateActualCost(
                         chunk.usage.prompt_tokens,
                         chunk.usage.completion_tokens,
                         chunk.model || requestModel
@@ -389,13 +292,11 @@ export class OpenRouterClient {
                     onUsage(usage);
                   }
                 } catch {
-                  // Not valid JSON, might be partial - continue
                   log.debug("Could not parse SSE chunk", { data });
                 }
               }
             }
 
-            // Pass through all data to client
             controller.enqueue(value);
           }
         } catch (error) {
@@ -422,10 +323,7 @@ export class OpenRouterClient {
       total_tokens: 0,
     };
 
-    // Estimate cost (we'll need model pricing for accurate calculation)
-    // For now, use a rough estimate based on typical pricing
-    // TODO: Fetch model pricing and calculate accurately
-    const estimatedCostUsd = this.estimateCost(
+    const estimatedCostUsd = estimateActualCost(
       usage.prompt_tokens,
       usage.completion_tokens,
       response.model || requestModel
@@ -438,46 +336,6 @@ export class OpenRouterClient {
       totalTokens: usage.total_tokens,
       estimatedCostUsd,
     };
-  }
-
-  /**
-   * Estimate cost based on token counts
-   * Uses rough averages - actual pricing varies by model
-   * TODO: Cache model pricing and calculate accurately
-   */
-  private estimateCost(
-    promptTokens: number,
-    completionTokens: number,
-    model: string
-  ): number {
-    // Default pricing (roughly GPT-4 turbo pricing as baseline)
-    // These are OpenRouter's prices per token
-    let promptCostPer1k = 0.01; // $0.01 per 1K prompt tokens
-    let completionCostPer1k = 0.03; // $0.03 per 1K completion tokens
-
-    // Adjust for known model categories
-    const modelLower = model.toLowerCase();
-    if (modelLower.includes("gpt-3.5") || modelLower.includes("claude-instant")) {
-      promptCostPer1k = 0.0005;
-      completionCostPer1k = 0.0015;
-    } else if (modelLower.includes("gpt-4o-mini") || modelLower.includes("claude-3-haiku")) {
-      promptCostPer1k = 0.00015;
-      completionCostPer1k = 0.0006;
-    } else if (modelLower.includes("gpt-4o") || modelLower.includes("claude-3.5-sonnet")) {
-      promptCostPer1k = 0.0025;
-      completionCostPer1k = 0.01;
-    } else if (modelLower.includes("gpt-4-turbo") || modelLower.includes("claude-3-opus")) {
-      promptCostPer1k = 0.01;
-      completionCostPer1k = 0.03;
-    } else if (modelLower.includes("llama") || modelLower.includes("mistral")) {
-      promptCostPer1k = 0.0002;
-      completionCostPer1k = 0.0002;
-    }
-
-    const promptCost = (promptTokens / 1000) * promptCostPer1k;
-    const completionCost = (completionTokens / 1000) * completionCostPer1k;
-
-    return promptCost + completionCost;
   }
 }
 
@@ -495,8 +353,6 @@ export class OpenRouterError extends Error {
     this.name = "OpenRouterError";
     this.status = status;
     this.details = details;
-
-    // 5xx errors and 429 (rate limit) are retryable
     this.retryable = status >= 500 || status === 429;
   }
 }

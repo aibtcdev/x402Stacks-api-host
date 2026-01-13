@@ -11,6 +11,7 @@
     "wrangler": "set -a && . ./.env && set +a && npx wrangler",
     "cf-typegen": "npm run wrangler -- types",
     "test": "bun run tests/_run_all_tests.ts",
+    "test:setup": "bun run tests/check-setup.ts",
     "test:quick": "bun run tests/_run_all_tests.ts --mode=quick",
     "test:full": "bun run tests/_run_all_tests.ts --mode=full",
     "test:category": "bun run tests/_run_all_tests.ts --category",

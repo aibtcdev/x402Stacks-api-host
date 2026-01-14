@@ -161,7 +161,7 @@ export class VerifySIP018 extends SimpleEndpoint {
 
       // The actual signed message is the hash
       // Verify the signature against this hash
-      let valid = false;
+      let valid: boolean;
       try {
         valid = verifyMessageSignatureRsv({
           message: structuredDataHash,

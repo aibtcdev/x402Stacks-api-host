@@ -100,7 +100,7 @@ export class VerifyMessage extends SimpleEndpoint {
       const cleanPubKey = publicKey.startsWith("0x") ? publicKey.slice(2) : publicKey;
 
       // Verify the signature
-      let valid = false;
+      let valid: boolean;
       try {
         valid = verifyMessageSignatureRsv({
           message,

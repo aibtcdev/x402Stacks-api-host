@@ -152,21 +152,31 @@ const ENDPOINT_CONFIG: Record<string, { tier: PricingTier; category: string }> =
 };
 
 function normalizeEndpoint(path: string): string {
-  // Remove path parameters: /stacks/profile/SP123 -> /stacks/profile
-  return path.replace(/\/[A-Za-z0-9]+$/, "").replace(/\/:[^/]+/g, "");
+  // Remove dynamic path parameters (Stacks addresses, UUIDs, etc.)
+  // Only strip segments that look like parameters, not endpoint names
+  // Stacks addresses: S[PT][A-Z0-9]{38,40}
+  // UUIDs: 8-4-4-4-12 hex
+  return path
+    .replace(/\/S[PT][A-Z0-9]{38,40}$/i, "") // Stacks addresses
+    .replace(/\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i, "") // UUIDs
+    .replace(/\/:[^/]+/g, ""); // Route params like :address
 }
 
 function getEndpointConfig(path: string): { tier: PricingTier; category: string } {
-  const normalized = normalizeEndpoint(path);
+  // Try exact match first (before any normalization)
+  if (ENDPOINT_CONFIG[path]) {
+    return ENDPOINT_CONFIG[path];
+  }
 
-  // Try exact match first
-  if (ENDPOINT_CONFIG[normalized]) {
+  // Try normalized path (strips dynamic parameters like addresses)
+  const normalized = normalizeEndpoint(path);
+  if (normalized !== path && ENDPOINT_CONFIG[normalized]) {
     return ENDPOINT_CONFIG[normalized];
   }
 
-  // Try prefix match
+  // Try prefix match on original path
   for (const [key, config] of Object.entries(ENDPOINT_CONFIG)) {
-    if (normalized.startsWith(key)) {
+    if (path.startsWith(key)) {
       return config;
     }
   }

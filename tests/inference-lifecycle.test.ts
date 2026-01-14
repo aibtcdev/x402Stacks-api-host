@@ -24,6 +24,7 @@ import {
   sleep,
   parseErrorResponse,
   parseResponseData,
+  type JsonBody,
 } from "./_shared_utils";
 
 interface X402PaymentRequired {
@@ -148,8 +149,6 @@ function validateCloudflareResponse(data: unknown): { valid: boolean; reason?: s
 // =============================================================================
 // Request Helper
 // =============================================================================
-
-type JsonBody = Record<string, unknown> | unknown[] | string | number | boolean | null;
 
 async function makeX402Request(
   x402Client: X402PaymentClient,
@@ -311,7 +310,7 @@ export async function runInferenceLifecycle(verbose = false): Promise<LifecycleT
   // Test OpenRouter models
   for (let i = 0; i < TEST_MODELS.openrouter.length; i++) {
     const model = TEST_MODELS.openrouter[i];
-    const question = questions[i % questions.length];
+    const question = questions[i];
     testIndex++;
 
     logger.info(`${testIndex}. Testing OpenRouter: ${model}`);
@@ -352,7 +351,7 @@ export async function runInferenceLifecycle(verbose = false): Promise<LifecycleT
   // Test Cloudflare AI
   testIndex++;
   const cfModel = TEST_MODELS.cloudflare;
-  const cfQuestion = questions[testIndex % questions.length];
+  const cfQuestion = questions[2];
 
   logger.info(`${testIndex}. Testing Cloudflare AI: ${cfModel}`);
   logger.debug(`Question: ${cfQuestion}`);

@@ -173,8 +173,8 @@ async function main() {
     if (X402_NETWORK === "testnet") {
       console.log(`${COLORS.cyan}To get testnet tokens:${COLORS.reset}`);
       console.log(`  STX:   https://explorer.hiro.so/sandbox/faucet?chain=testnet`);
-      console.log(`  sBTC:  (testnet sBTC faucet if available)`);
-      console.log(`  USDCx: (testnet USDCx faucet if available)\n`);
+      console.log(`  sBTC:  https://platform.hiro.so/faucet`);
+      console.log(`  USDCx: (no testnet faucet available yet)\n`);
     }
 
     process.exit(1);

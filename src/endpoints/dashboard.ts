@@ -54,8 +54,6 @@ export class Dashboard extends OpenAPIRoute {
         summary: {
           totalEndpoints: 0,
           totalCalls: 0,
-          totalSuccessful: 0,
-          avgSuccessRate: 0,
           earningsSTX: 0,
           earningsSBTC: 0,
           earningsUSDCx: 0,
@@ -79,8 +77,6 @@ interface DashboardData {
   summary: {
     totalEndpoints: number;
     totalCalls: number;
-    totalSuccessful: number;
-    avgSuccessRate: number;
     earningsSTX: number;
     earningsSBTC: number;
     earningsUSDCx: number;
@@ -89,7 +85,6 @@ interface DashboardData {
     endpoint: string;
     category: string;
     totalCalls: number;
-    successfulCalls: number;
     errorCalls: number;
     avgLatencyMs: number;
     totalBytes: number;
@@ -353,9 +348,6 @@ function generateDashboardHTML(data: DashboardData, environment: string): string
       padding: 4px 8px;
       border-radius: 4px;
     }
-    .success-high { color: #4ade80; }
-    .success-med { color: #fbbf24; }
-    .success-low { color: #f87171; }
     .cat-inference { color: #a855f7; }
     .cat-stacks { color: var(--accent); }
     .cat-hashing { color: #06b6d4; }
@@ -426,9 +418,9 @@ function generateDashboardHTML(data: DashboardData, environment: string): string
     }
 
     @media (max-width: 768px) {
+      th:nth-child(5), td:nth-child(5),
       th:nth-child(6), td:nth-child(6),
-      th:nth-child(7), td:nth-child(7),
-      th:nth-child(9), td:nth-child(9) { display: none; }
+      th:nth-child(8), td:nth-child(8) { display: none; }
     }
   </style>
 </head>
@@ -459,10 +451,6 @@ function generateDashboardHTML(data: DashboardData, environment: string): string
       <div class="card">
         <h3>Total Calls</h3>
         <div class="value">${summary.totalCalls.toLocaleString()}</div>
-      </div>
-      <div class="card">
-        <h3>Success Rate</h3>
-        <div class="value success">${summary.avgSuccessRate.toFixed(1)}%</div>
       </div>
       <div class="card">
         <h3>STX Earned</h3>
@@ -507,7 +495,6 @@ function generateDashboardHTML(data: DashboardData, environment: string): string
               <th data-sort="endpoint">Endpoint <span class="sort-icon">↕</span></th>
               <th data-sort="category">Category <span class="sort-icon">↕</span></th>
               <th data-sort="calls" class="sorted">Calls <span class="sort-icon">↓</span></th>
-              <th data-sort="success">Success <span class="sort-icon">↕</span></th>
               <th data-sort="errors">Errors <span class="sort-icon">↕</span></th>
               <th data-sort="latency">Latency <span class="sort-icon">↕</span></th>
               <th data-sort="bytes">Data <span class="sort-icon">↕</span></th>
@@ -517,8 +504,6 @@ function generateDashboardHTML(data: DashboardData, environment: string): string
           </thead>
           <tbody>
             ${sortedEndpoints.map((ep) => {
-              const successRate = ep.totalCalls > 0 ? ((ep.successfulCalls / ep.totalCalls) * 100) : 0;
-              const successClass = successRate >= 95 ? "success-high" : successRate >= 80 ? "success-med" : "success-low";
               const lastCallTs = ep.lastCall ? new Date(ep.lastCall).getTime() : 0;
               const lastCallDisplay = ep.lastCall ? new Date(ep.lastCall).toLocaleString() : "-";
               const bytesDisplay = ep.totalBytes > 1048576
@@ -528,11 +513,10 @@ function generateDashboardHTML(data: DashboardData, environment: string): string
                   : `${ep.totalBytes} B`;
 
               return `
-                <tr data-endpoint="${ep.endpoint}" data-category="${ep.category}" data-calls="${ep.totalCalls}" data-success="${successRate.toFixed(1)}" data-errors="${ep.errorCalls}" data-latency="${ep.avgLatencyMs}" data-bytes="${ep.totalBytes}" data-stx="${ep.earningsSTX}" data-lastcall="${lastCallTs}">
+                <tr data-endpoint="${ep.endpoint}" data-category="${ep.category}" data-calls="${ep.totalCalls}" data-errors="${ep.errorCalls}" data-latency="${ep.avgLatencyMs}" data-bytes="${ep.totalBytes}" data-stx="${ep.earningsSTX}" data-lastcall="${lastCallTs}">
                   <td><code>${ep.endpoint}</code></td>
                   <td class="${getCategoryClass(ep.category)}">${ep.category}</td>
                   <td>${ep.totalCalls.toLocaleString()}</td>
-                  <td class="${successClass}">${successRate.toFixed(1)}%</td>
                   <td>${ep.errorCalls.toLocaleString()}</td>
                   <td>${ep.avgLatencyMs}ms</td>
                   <td>${bytesDisplay}</td>
@@ -592,7 +576,7 @@ function generateDashboardHTML(data: DashboardData, environment: string): string
 
       const tbody = table.querySelector('tbody');
       const headers = table.querySelectorAll('th[data-sort]');
-      const numericKeys = ['calls', 'success', 'errors', 'latency', 'bytes', 'stx', 'lastcall'];
+      const numericKeys = ['calls', 'errors', 'latency', 'bytes', 'stx', 'lastcall'];
       let currentSort = { key: 'calls', dir: 'desc' };
 
       function sortTable(key) {

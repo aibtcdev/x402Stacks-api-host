@@ -76,6 +76,9 @@ import {
 // Dashboard endpoint
 import { Dashboard } from "./endpoints/dashboard";
 
+// x402 schema generator
+import { generateX402Schema } from "./utils/x402-schema";
+
 // Durable Objects
 export { UsageDO } from "./durable-objects/UsageDO";
 export { StorageDO } from "./durable-objects/StorageDO";
@@ -216,7 +219,7 @@ function classifyError(statusCode: number): string {
 // =============================================================================
 
 // Routes that don't require payment
-const FREE_ROUTES = new Set(["/", "/health", "/docs", "/openapi.json", "/dashboard"]);
+const FREE_ROUTES = new Set(["/", "/health", "/docs", "/openapi.json", "/x402.json", "/dashboard"]);
 
 // Free endpoints (model listings)
 const FREE_ENDPOINTS = new Set([
@@ -411,6 +414,17 @@ app.get("/health", (c) => {
     environment: c.env.ENVIRONMENT,
     timestamp: new Date().toISOString(),
   });
+});
+
+// x402 discovery schema (for scan.stacksx402.com registration)
+app.get("/x402.json", (c) => {
+  const schema = generateX402Schema({
+    network: c.env.X402_NETWORK === "mainnet" ? "mainnet" : "testnet",
+    payTo: c.env.X402_SERVER_ADDRESS || "",
+    name: "x402 Stacks API",
+    image: "https://aibtc.dev/logos/aibtcdev-avatar-1000px.png",
+  });
+  return c.json(schema);
 });
 
 // Dashboard (free, HTML)

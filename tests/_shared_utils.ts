@@ -34,6 +34,24 @@ export const X402_WORKER_URL = getWorkerUrl();
 
 export const TEST_TOKENS: TokenType[] = ["STX", "sBTC", "USDCx"];
 
+// =============================================================================
+// Timing Constants
+// =============================================================================
+
+/** Delay between test steps (e.g., between CRUD operations in lifecycle tests) */
+export const STEP_DELAY_MS = 300;
+
+/** Default delay between independent tests */
+export const DEFAULT_TEST_DELAY_MS = 500;
+
+/** Small delay after lifecycle tests before continuing */
+export const POST_LIFECYCLE_DELAY_MS = 100;
+
+/** Helper to generate unique test IDs (timestamp + random) */
+export function generateTestId(prefix = "test"): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 export interface TestLogger {
   info: (msg: string) => void;
   success: (msg: string) => void;

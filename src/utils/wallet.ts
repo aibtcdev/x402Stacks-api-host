@@ -14,18 +14,16 @@ export async function deriveChildAccount(
   mnemonic: string,
   index: number
 ) {
-  // using a blank password since wallet isn't persisted
-  const password = "";
-  // create a Stacks wallet with the mnemonic
-  let wallet = await generateWallet({
+  // Create wallet with empty password (wallet isn't persisted)
+  const wallet = await generateWallet({
     secretKey: mnemonic,
-    password: password,
+    password: "",
   });
-  // add a new account to reach the selected index
+  // Generate accounts up to the requested index
   for (let i = 0; i <= index; i++) {
-    wallet = generateNewAccount(wallet);
+    generateNewAccount(wallet);
   }
-  // return address and key for selected index
+  // Return address and key for selected index
   return {
     address: getStxAddress({
       account: wallet.accounts[index],

@@ -4,10 +4,24 @@
 # Cron:  0 * * * * /home/whoabuddy/dev/aibtcdev/x402-api/scripts/run-tests-cron.sh
 
 # Set up PATH for cron environment (bun, node, npm, etc.)
-export PATH="$HOME/.bun/bin:$HOME/.nvm/versions/node/$(ls -1 $HOME/.nvm/versions/node 2>/dev/null | tail -1)/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+NODE_VERSIONS_DIR="$HOME/.nvm/versions/node"
+NODE_PATH_PART=""
+if [ -d "$NODE_VERSIONS_DIR" ]; then
+  LATEST_NODE_VERSION="$(ls -1 "$NODE_VERSIONS_DIR" 2>/dev/null | tail -1)"
+  if [ -n "$LATEST_NODE_VERSION" ] && [ -d "$NODE_VERSIONS_DIR/$LATEST_NODE_VERSION/bin" ]; then
+    NODE_PATH_PART="$NODE_VERSIONS_DIR/$LATEST_NODE_VERSION/bin:"
+  fi
+fi
+export PATH="$HOME/.bun/bin:${NODE_PATH_PART}/usr/local/bin:/usr/bin:/bin:$PATH"
 
-# Change to project directory
-cd "$(dirname "$0")/.."
+# Change to project directory (robust to symlinks)
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd)"
+if [ -z "$SCRIPT_DIR" ]; then
+  echo "Error: Unable to determine script directory." >&2
+  exit 1
+fi
+cd "$SCRIPT_DIR/.." || { echo "Error: Failed to change directory to project root." >&2; exit 1; }
 
 # Load environment variables from .env if it exists
 if [ -f .env ]; then
@@ -58,7 +72,9 @@ echo "Exit Code: $EXIT_CODE" >> "$TEMP_LOG"
 if [ $EXIT_CODE -ne 0 ]; then
   mv "$TEMP_LOG" "$LOG_FILE"
   # Keep only last 7 days of failure logs
-  find "$LOG_DIR" -name "test-*.log" -mtime +7 -delete 2>/dev/null || true
+  if ! find "$LOG_DIR" -name "test-*.log" -mtime +7 -delete 2>/dev/null; then
+    echo "Warning: failed to delete old test logs in '$LOG_DIR'" >&2
+  fi
 else
   rm -f "$TEMP_LOG"
 fi

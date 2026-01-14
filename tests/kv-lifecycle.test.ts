@@ -18,6 +18,8 @@ import {
   X402_NETWORK,
   X402_WORKER_URL,
   createTestLogger,
+  STEP_DELAY_MS,
+  generateTestId,
 } from "./_shared_utils";
 
 interface X402PaymentRequired {
@@ -30,11 +32,20 @@ interface X402PaymentRequired {
   tokenType: TokenType;
 }
 
+/** JSON-serializable body type */
+type JsonBody =
+  | Record<string, unknown>
+  | unknown[]
+  | string
+  | number
+  | boolean
+  | null;
+
 async function makeX402Request(
   x402Client: X402PaymentClient,
   endpoint: string,
   method: "GET" | "POST" | "DELETE",
-  body: unknown,
+  body: JsonBody | undefined,
   tokenType: TokenType,
   logger: ReturnType<typeof createTestLogger>
 ): Promise<{ status: number; data: unknown }> {
@@ -103,7 +114,7 @@ export async function runKvLifecycle(verbose = false): Promise<LifecycleTestResu
 
   // Test with STX only to save on payments
   const tokenType: TokenType = "STX";
-  const testKey = `test-key-${Date.now()}`;
+  const testKey = generateTestId("kv-key");
   const testValue = JSON.stringify({ message: "Hello from KV test", timestamp: Date.now() });
 
   let successCount = 0;
@@ -132,7 +143,7 @@ export async function runKvLifecycle(verbose = false): Promise<LifecycleTestResu
     return { passed: 0, total: totalTests, success: false };
   }
 
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await new Promise((resolve) => setTimeout(resolve, STEP_DELAY_MS));
 
   // Test 2: Get the value back
   logger.info("2. Testing /storage/kv/:key (GET)...");
@@ -153,7 +164,7 @@ export async function runKvLifecycle(verbose = false): Promise<LifecycleTestResu
     logger.error(`Get failed: ${JSON.stringify(getResult.data)}`);
   }
 
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await new Promise((resolve) => setTimeout(resolve, STEP_DELAY_MS));
 
   // Test 3: List keys
   logger.info("3. Testing /storage/kv (GET - list)...");
@@ -179,7 +190,7 @@ export async function runKvLifecycle(verbose = false): Promise<LifecycleTestResu
     logger.error(`List failed: ${JSON.stringify(listResult.data)}`);
   }
 
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await new Promise((resolve) => setTimeout(resolve, STEP_DELAY_MS));
 
   // Test 4: Delete the key
   logger.info("4. Testing /storage/kv/:key (DELETE)...");
@@ -200,7 +211,7 @@ export async function runKvLifecycle(verbose = false): Promise<LifecycleTestResu
     logger.error(`Delete failed: ${JSON.stringify(deleteResult.data)}`);
   }
 
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await new Promise((resolve) => setTimeout(resolve, STEP_DELAY_MS));
 
   // Test 5: Verify deletion
   logger.info("5. Verifying deletion...");

@@ -7,6 +7,7 @@
 
 import type { TestConfig } from "./_test_generator";
 import type { TokenType } from "x402-stacks";
+import { generateTestId } from "./_shared_utils";
 
 // =============================================================================
 // Test Fixtures
@@ -213,7 +214,7 @@ const kvEndpoints: TestConfig[] = [
     name: "kv-set",
     endpoint: "/storage/kv",
     method: "POST",
-    body: { key: `test-${Date.now()}`, value: JSON.stringify({ test: true }) },
+    body: { key: generateTestId("kv"), value: JSON.stringify({ test: true }) },
     validateResponse: (data, tokenType) =>
       isOk(data) && hasFields(data, ["key", "created"]) && hasTokenType(data, tokenType),
   },
@@ -222,7 +223,10 @@ const kvEndpoints: TestConfig[] = [
     endpoint: "/storage/kv/nonexistent-key",
     method: "GET",
     allowedStatuses: [404],
-    validateResponse: (data, tokenType) => hasTokenType(data, tokenType) || hasField(data, "error"),
+    // Valid if: (success response with tokenType) OR (error response with error field)
+    validateResponse: (data, tokenType) =>
+      (isOk(data) && hasTokenType(data, tokenType)) ||
+      (hasField(data, "error") && hasField(data, "ok") && (data as { ok: boolean }).ok === false),
   },
   {
     name: "kv-list",
@@ -236,7 +240,10 @@ const kvEndpoints: TestConfig[] = [
     endpoint: "/storage/kv/nonexistent-key",
     method: "DELETE",
     allowedStatuses: [404],
-    validateResponse: (data, tokenType) => hasTokenType(data, tokenType) || hasField(data, "error"),
+    // Valid if: (success response with tokenType) OR (error response with error field)
+    validateResponse: (data, tokenType) =>
+      (isOk(data) && hasTokenType(data, tokenType)) ||
+      (hasField(data, "error") && hasField(data, "ok") && (data as { ok: boolean }).ok === false),
   },
 ];
 
@@ -258,14 +265,18 @@ const pasteEndpoints: TestConfig[] = [
     endpoint: "/storage/paste/nonexistent",
     method: "GET",
     allowedStatuses: [404],
-    validateResponse: (data, tokenType) => hasTokenType(data, tokenType) || hasField(data, "error"),
+    validateResponse: (data, tokenType) =>
+      (isOk(data) && hasTokenType(data, tokenType)) ||
+      (hasField(data, "error") && hasField(data, "ok") && (data as { ok: boolean }).ok === false),
   },
   {
     name: "paste-delete",
     endpoint: "/storage/paste/nonexistent",
     method: "DELETE",
     allowedStatuses: [404],
-    validateResponse: (data, tokenType) => hasTokenType(data, tokenType) || hasField(data, "error"),
+    validateResponse: (data, tokenType) =>
+      (isOk(data) && hasTokenType(data, tokenType)) ||
+      (hasField(data, "error") && hasField(data, "ok") && (data as { ok: boolean }).ok === false),
   },
 ];
 
@@ -362,6 +373,7 @@ const queueEndpoints: TestConfig[] = [
     endpoint: "/storage/queue/pop",
     method: "POST",
     body: { name: "test-queue", count: 1 },
+    // Response has items array (may be empty if queue was empty)
     validateResponse: (data, tokenType) =>
       isOk(data) && hasField(data, "items") && hasTokenType(data, tokenType),
   },
@@ -369,6 +381,7 @@ const queueEndpoints: TestConfig[] = [
     name: "queue-peek",
     endpoint: "/storage/queue/peek?name=test-queue",
     method: "GET",
+    // Response has items array (may be empty)
     validateResponse: (data, tokenType) =>
       isOk(data) && hasField(data, "items") && hasTokenType(data, tokenType),
   },
@@ -399,7 +412,7 @@ const memoryEndpoints: TestConfig[] = [
     endpoint: "/storage/memory/store",
     method: "POST",
     body: {
-      items: [{ id: `test-${Date.now()}`, text: "This is a test memory for the API." }],
+      items: [{ id: generateTestId("mem"), text: "This is a test memory for the API." }],
     },
     validateResponse: (data, tokenType) =>
       isOk(data) && hasField(data, "stored") && hasTokenType(data, tokenType),

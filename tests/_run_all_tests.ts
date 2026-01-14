@@ -44,6 +44,8 @@ import {
   X402_NETWORK,
   X402_WORKER_URL,
   createTestLogger,
+  DEFAULT_TEST_DELAY_MS,
+  POST_LIFECYCLE_DELAY_MS,
 } from "./_shared_utils";
 
 // Import lifecycle test runners
@@ -165,7 +167,7 @@ function parseArgs(): RunConfig {
     filter: null,
     maxConsecutiveFailures: 5,
     verbose: process.env.VERBOSE === "1",
-    delayMs: parseInt(process.env.TEST_DELAY_MS || "500", 10),
+    delayMs: parseInt(process.env.TEST_DELAY_MS || String(DEFAULT_TEST_DELAY_MS), 10),
     maxRetries: parseInt(process.env.TEST_MAX_RETRIES || "3", 10),
   };
 
@@ -181,10 +183,13 @@ function parseArgs(): RunConfig {
       tokenSpecified = true;
     } else if (arg.startsWith("--token=")) {
       const rawToken = arg.split("=")[1].toUpperCase();
-      const token = (
-        rawToken === "SBTC" ? "sBTC" : rawToken === "USDCX" ? "USDCx" : rawToken
-      ) as TokenType;
-      if (["STX", "sBTC", "USDCx"].includes(token)) {
+      // Normalize token name (SBTC -> sBTC, USDCX -> USDCx)
+      const normalizedToken =
+        rawToken === "SBTC" ? "sBTC" : rawToken === "USDCX" ? "USDCx" : rawToken;
+      // Validate after normalization
+      const validTokens: TokenType[] = ["STX", "sBTC", "USDCx"];
+      if (validTokens.includes(normalizedToken as TokenType)) {
+        const token = normalizedToken as TokenType;
         if (!tokenSpecified) {
           config.tokens = [];
           tokenSpecified = true;
@@ -377,7 +382,8 @@ async function testEndpointWithToken(
       if (isRetryableError(retryRes.status, errorCode, errorMessage || errText) && attempt < maxRetries) {
         const retryAfterSecs = retryAfterHeader ? parseInt(retryAfterHeader, 10) : bodyRetryAfter || 0;
         const backoffMs = Math.min(1000 * Math.pow(2, attempt), 10000);
-        const delayMs = retryAfterSecs > 0 ? retryAfterSecs * 1000 : backoffMs;
+        // Respect server's retryAfter if larger than our backoff (don't retry too early)
+        const delayMs = retryAfterSecs > 0 ? Math.max(retryAfterSecs * 1000, backoffMs) : backoffMs;
 
         logger.debug(`Rate limited (${retryRes.status}), waiting ${delayMs}ms before retry...`);
         await sleep(delayMs);
@@ -504,7 +510,8 @@ async function runStatelessTests(
       consecutiveFailures++;
     }
 
-    await sleep(100);
+    // Small delay between test iterations for stability
+    await sleep(POST_LIFECYCLE_DELAY_MS);
   }
 }
 

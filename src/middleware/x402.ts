@@ -131,6 +131,15 @@ function extractPayerAddress(
 }
 
 /**
+ * Safely serialize object with BigInt values converted to strings
+ */
+function safeStringify(obj: unknown): string {
+  return JSON.stringify(obj, (_, value) =>
+    typeof value === "bigint" ? value.toString() : value
+  );
+}
+
+/**
  * Classify payment errors for appropriate response
  */
 function classifyPaymentError(error: unknown, settleResult?: SettlePaymentResult): {
@@ -322,7 +331,8 @@ export function x402Middleware(
 
       log.debug("Settle result", settleResult);
     } catch (error) {
-      log.error("Payment verification exception", { error: String(error) });
+      const errorStr = String(error);
+      log.error("Payment verification exception", { error: errorStr });
 
       const classified = classifyPaymentError(error);
       if (classified.retryAfter) {
@@ -335,6 +345,9 @@ export function x402Middleware(
           code: classified.code,
           tokenType,
           resource: c.req.path,
+          details: {
+            exceptionMessage: errorStr,
+          },
         },
         classified.httpStatus as 400 | 402 | 500 | 502 | 503
       );
@@ -396,8 +409,8 @@ export function x402Middleware(
       parsedBody,
     } as X402Context);
 
-    // Add response headers
-    c.header("X-PAYMENT-RESPONSE", JSON.stringify(settleResult));
+    // Add response headers (use safeStringify for BigInt compatibility)
+    c.header("X-PAYMENT-RESPONSE", safeStringify(settleResult));
     c.header("X-PAYER-ADDRESS", payerAddress);
 
     return next();

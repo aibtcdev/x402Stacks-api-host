@@ -370,11 +370,13 @@ async function testEndpointWithToken(
       let errorCode: string | undefined;
       let errorMessage: string | undefined;
       let bodyRetryAfter: number | undefined;
+      let errorDetails: Record<string, unknown> | undefined;
       try {
         const parsed = JSON.parse(errText);
         errorCode = parsed.code;
         errorMessage = parsed.error || parsed.details?.exceptionMessage || parsed.details?.settleError;
         bodyRetryAfter = parsed.retryAfter;
+        errorDetails = parsed.details;
       } catch {
         /* not JSON */
       }
@@ -385,7 +387,13 @@ async function testEndpointWithToken(
         // Respect server's retryAfter if larger than our backoff (don't retry too early)
         const delayMs = retryAfterSecs > 0 ? Math.max(retryAfterSecs * 1000, backoffMs) : backoffMs;
 
-        logger.debug(`Rate limited (${retryRes.status}), waiting ${delayMs}ms before retry...`);
+        const errorSummary = errorMessage || errorCode || errText.slice(0, 100);
+        const errorType = retryRes.status === 429 ? "Rate limited" : `Server error`;
+        logger.debug(`${errorType} (${retryRes.status}): ${errorSummary}`);
+        if (errorDetails) {
+          logger.debug(`Details: ${JSON.stringify(errorDetails)}`);
+        }
+        logger.debug(`Waiting ${delayMs}ms before retry...`);
         await sleep(delayMs);
         continue;
       }

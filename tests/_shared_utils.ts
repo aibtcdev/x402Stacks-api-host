@@ -87,7 +87,10 @@ export function isRetryableError(
       "rate limit",
       "too many requests",
       "settle",
-      "failed",
+      "connection failed",
+      "request failed",
+      "payment failed",
+      "transaction failed",
       "timeout",
       "temporarily",
       "try again",
@@ -108,6 +111,64 @@ export function calculateBackoff(attempt: number, retryAfterSecs?: number): numb
     return Math.max(retryAfterSecs * 1000, backoffMs);
   }
   return backoffMs;
+}
+
+/**
+ * HTTP status codes that represent terminal (non-retryable) outcomes.
+ *
+ * - 200: Successful response
+ * - 404: "Not found" is expected in some lifecycle test steps (e.g., verifying
+ *   a KV key was deleted). We treat it as terminal rather than retrying.
+ */
+export const TERMINAL_STATUS_CODES = [200, 404];
+
+/**
+ * Check if a status code represents a terminal (non-retryable) outcome.
+ * Returns true for success (200) and expected "not found" cases (404).
+ */
+export function isTerminalStatus(status: number): boolean {
+  return TERMINAL_STATUS_CODES.includes(status);
+}
+
+/**
+ * Parsed error response from API
+ */
+export interface ParsedErrorInfo {
+  errorCode?: string;
+  errorMessage?: string;
+  retryAfterSecs?: number;
+  rawText: string;
+}
+
+/**
+ * Parse error information from response text.
+ * Attempts to extract structured error data from JSON, falls back to raw text.
+ */
+export function parseErrorResponse(text: string): ParsedErrorInfo {
+  const result: ParsedErrorInfo = { rawText: text };
+
+  try {
+    const parsed = JSON.parse(text);
+    result.errorCode = parsed.code;
+    result.errorMessage = parsed.error;
+    result.retryAfterSecs = parsed.retryAfter;
+  } catch {
+    // Not JSON - rawText is already set
+  }
+
+  return result;
+}
+
+/**
+ * Attempt to parse response body as JSON, fall back to raw text.
+ * Returns the parsed data for use in test results.
+ */
+export function parseResponseData(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
 }
 
 /** Helper to generate unique test IDs (timestamp + random) */

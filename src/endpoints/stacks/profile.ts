@@ -16,7 +16,7 @@ export class Profile extends SimpleEndpoint {
     description: "Returns a comprehensive profile including balances, BNS name, and token holdings.",
     parameters: [
       {
-        name: "addressOrName",
+        name: "address",
         in: "path" as const,
         required: true,
         schema: { type: "string" as const },
@@ -70,10 +70,10 @@ export class Profile extends SimpleEndpoint {
   async handle(c: AppContext) {
     const tokenType = this.getTokenType(c);
     const log = c.var.logger;
-    const input = c.req.param("addressOrName");
+    const input = c.req.param("address");
 
     if (!input) {
-      return this.errorResponse(c, "addressOrName parameter is required", 400);
+      return this.errorResponse(c, "address parameter is required", 400);
     }
 
     const network = c.env.X402_NETWORK || "mainnet";

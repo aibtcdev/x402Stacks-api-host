@@ -100,11 +100,19 @@ export class VerifyMessage extends SimpleEndpoint {
       const cleanPubKey = publicKey.startsWith("0x") ? publicKey.slice(2) : publicKey;
 
       // Verify the signature
-      const valid = verifyMessageSignatureRsv({
-        message,
-        signature: cleanSig,
-        publicKey: cleanPubKey,
-      });
+      let valid: boolean;
+      try {
+        valid = verifyMessageSignatureRsv({
+          message,
+          signature: cleanSig,
+          publicKey: cleanPubKey,
+        });
+      } catch (cryptoError) {
+        // Cryptographic validation errors (invalid signature format, invalid pubkey, etc.)
+        // are treated as invalid signatures rather than API errors
+        c.var.logger.debug("Signature cryptographically invalid", { error: String(cryptoError) });
+        valid = false;
+      }
 
       return c.json({
         ok: true,

@@ -161,11 +161,19 @@ export class VerifySIP018 extends SimpleEndpoint {
 
       // The actual signed message is the hash
       // Verify the signature against this hash
-      const valid = verifyMessageSignatureRsv({
-        message: structuredDataHash,
-        signature: cleanSig,
-        publicKey: cleanPubKey,
-      });
+      let valid: boolean;
+      try {
+        valid = verifyMessageSignatureRsv({
+          message: structuredDataHash,
+          signature: cleanSig,
+          publicKey: cleanPubKey,
+        });
+      } catch (cryptoError) {
+        // Cryptographic validation errors (invalid signature format, invalid pubkey, etc.)
+        // are treated as invalid signatures rather than API errors
+        c.var.logger.debug("SIP-018 signature cryptographically invalid", { error: String(cryptoError) });
+        valid = false;
+      }
 
       return c.json({
         ok: true,

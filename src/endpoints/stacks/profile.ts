@@ -16,7 +16,7 @@ export class Profile extends SimpleEndpoint {
     description: "Returns a comprehensive profile including balances, BNS name, and token holdings.",
     parameters: [
       {
-        name: "addressOrName",
+        name: "address",
         in: "path" as const,
         required: true,
         schema: { type: "string" as const },

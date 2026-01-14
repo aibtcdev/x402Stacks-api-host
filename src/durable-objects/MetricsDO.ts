@@ -433,12 +433,10 @@ export class MetricsDO extends DurableObject<Env> {
     totalEndpoints: number;
     totalCalls: number;
     totalSuccessful: number;
-    totalErrors: number;
     avgSuccessRate: number;
     earningsSTX: number;
     earningsSBTC: number;
     earningsUSDCx: number;
-    uniqueColos: number;
   }> {
     const endpointCount = this.sql
       .exec("SELECT COUNT(*) as cnt FROM endpoint_stats")
@@ -449,17 +447,12 @@ export class MetricsDO extends DurableObject<Env> {
         `SELECT
           COALESCE(SUM(total_calls), 0) as total_calls,
           COALESCE(SUM(successful_calls), 0) as successful,
-          COALESCE(SUM(error_calls), 0) as errors,
           COALESCE(SUM(earnings_stx), 0) as stx,
           COALESCE(SUM(earnings_sbtc), 0) as sbtc,
           COALESCE(SUM(earnings_usdcx), 0) as usdcx
          FROM endpoint_stats`
       )
       .toArray()[0];
-
-    const coloCount = this.sql
-      .exec("SELECT COUNT(*) as cnt FROM colo_stats")
-      .toArray()[0]?.cnt as number || 0;
 
     const totalCalls = (totals?.total_calls as number) || 0;
     const successful = (totals?.successful as number) || 0;
@@ -468,12 +461,10 @@ export class MetricsDO extends DurableObject<Env> {
       totalEndpoints: endpointCount,
       totalCalls,
       totalSuccessful: successful,
-      totalErrors: (totals?.errors as number) || 0,
       avgSuccessRate: totalCalls > 0 ? (successful / totalCalls) * 100 : 0,
       earningsSTX: (totals?.stx as number) || 0,
       earningsSBTC: (totals?.sbtc as number) || 0,
       earningsUSDCx: (totals?.usdcx as number) || 0,
-      uniqueColos: coloCount,
     };
   }
 

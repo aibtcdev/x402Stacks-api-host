@@ -209,13 +209,11 @@ export const metricsStorageWriteLarge = metricsStandard;
 export async function getDashboardData(env: Env) {
   const metricsDO = getMetricsDO(env);
 
-  const [summary, endpoints, daily, colos, errors, recentRequests, modelStats] =
+  const [summary, endpoints, daily, recentRequests, modelStats] =
     await Promise.all([
       metricsDO.getSummary(),
       metricsDO.getEndpointStats(),
       metricsDO.getDailyStats(7),
-      metricsDO.getColoStats(),
-      metricsDO.getErrorStats(),
       metricsDO.getRecentRequests(10),
       metricsDO.getModelStats(),
     ]);
@@ -224,8 +222,6 @@ export async function getDashboardData(env: Env) {
     summary,
     endpoints,
     daily,
-    colos,
-    errors,
     recentRequests,
     modelStats,
   };

@@ -418,9 +418,8 @@ function generateDashboardHTML(data: DashboardData, environment: string): string
     }
 
     @media (max-width: 768px) {
-      th:nth-child(5), td:nth-child(5),
-      th:nth-child(6), td:nth-child(6),
-      th:nth-child(7), td:nth-child(7),
+      /* Hide Latency (4) and Created (8) on mobile, keep earnings visible */
+      th:nth-child(4), td:nth-child(4),
       th:nth-child(8), td:nth-child(8) { display: none; }
     }
   </style>

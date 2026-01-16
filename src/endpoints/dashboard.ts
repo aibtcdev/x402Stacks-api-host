@@ -152,9 +152,20 @@ function generateDashboardHTML(data: DashboardData, environment: string): string
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>x402 API Dashboard</title>
-  <link rel="preconnect" href="https://rsms.me/">
-  <link rel="stylesheet" href="https://rsms.me/inter/inter.css">
+  <link rel="icon" type="image/png" sizes="32x32" href="https://aibtc.com/favicon-32x32.png">
   <style>
+    @font-face {
+      font-family: 'Roc Grotesk';
+      src: url('https://aibtc.com/fonts/RocGrotesk-Regular.woff2') format('woff2');
+      font-weight: 400;
+      font-display: swap;
+    }
+    @font-face {
+      font-family: 'Roc Grotesk';
+      src: url('https://aibtc.com/fonts/RocGrotesk-WideMedium.woff2') format('woff2');
+      font-weight: 500;
+      font-display: swap;
+    }
     :root {
       --bg-primary: #09090b;
       --bg-card: #0f0f12;
@@ -166,17 +177,29 @@ function generateDashboardHTML(data: DashboardData, environment: string): string
       --text-muted: #71717a;
       --accent: #f7931a;
       --accent-dim: rgba(247, 147, 26, 0.12);
+      --color-blue: #7DA2FF;
+      --color-purple: #A855F7;
       --success: #22c55e;
       --error: #ef4444;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-      background: var(--bg-primary);
+      font-family: 'Roc Grotesk', system-ui, sans-serif;
+      background: linear-gradient(135deg, #000000, #0a0a0a, #050208);
       color: var(--text-primary);
       min-height: 100vh;
       line-height: 1.5;
       -webkit-font-smoothing: antialiased;
+    }
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background: url('https://aibtc.com/Artwork/AIBTC_Pattern1_optimized.jpg') center/cover;
+      opacity: 0.12;
+      filter: saturate(1.3);
+      pointer-events: none;
+      z-index: -1;
     }
     .container { max-width: 1600px; margin: 0 auto; padding: 24px; }
     .header {
@@ -427,9 +450,12 @@ function generateDashboardHTML(data: DashboardData, environment: string): string
 <body>
   <div class="container">
     <div class="header">
-      <div>
-        <h1><span class="accent">x402</span> Dashboard</h1>
-        <p class="subtitle">Real-time metrics for pay-per-use API on Stacks</p>
+      <div style="display: flex; align-items: center;">
+        <img src="https://aibtc.com/Primary_Logo/SVG/AIBTC_PrimaryLogo_KO.svg" alt="AIBTC" style="height: 32px; margin-right: 12px;">
+        <div>
+          <h1><span class="accent">x402</span> Dashboard</h1>
+          <p class="subtitle">Real-time metrics for pay-per-use API on Stacks</p>
+        </div>
       </div>
       <span class="env-badge">${environment}</span>
     </div>
